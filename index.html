@@ -145,7 +145,10 @@
     border-top: 1px solid var(--line);
   }
   .sheet.open { transform: none; }
-  .grab { width: 38px; height: 5px; border-radius: 3px; background: var(--line); margin: 0 auto 12px; }
+  .sheet { overscroll-behavior: contain; }
+  /* The handle stays pinned at the top while a long sheet scrolls; drag it (or the top of the sheet) down to close. */
+  .grab-zone { position: sticky; top: -10px; z-index: 5; margin: -10px -18px 4px; padding: 10px 18px 12px; background: var(--sheet); cursor: grab; touch-action: none; }
+  .grab { width: 40px; height: 5px; border-radius: 3px; background: var(--muted); opacity: .45; margin: 0 auto; }
   .sheet h2 { font-size: 17px; margin: 0 0 12px; }
   .sheet h3 { font-size: 11px; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); margin: 18px 0 8px; font-weight: 600; }
   .opt {
@@ -250,7 +253,7 @@
 </div>
 
 <div class="shade" id="shade" data-act="close"></div>
-<div class="sheet" id="sheet"><div class="grab"></div><div id="sheetBody"></div></div>
+<div class="sheet" id="sheet" role="dialog" aria-modal="true"><div class="grab-zone" data-act="close" aria-label="Close"><div class="grab"></div></div><div id="sheetBody"></div></div>
 <div class="toast" id="toast"></div>
 
 <script>
@@ -287,7 +290,7 @@ const DEFAULTS = {
   cushion: 1,      // arrive at least this early
   carWalk: 3       // stop -> car on the way back
 };
-const BUILD = "20261108145145";   // replaced with a timestamp by publish.sh
+const BUILD = "20261108145447";   // replaced with a timestamp by publish.sh
 const DEV = !/^\d+$/.test(BUILD);
 const SCHED = BUNDLED_SCHEDULE || { routes: {}, stops: {}, feed_info: {} };
 
@@ -1017,6 +1020,7 @@ let toastT;
 function toast(msg) { const el = $("toast"); el.textContent = msg; el.classList.add("show"); clearTimeout(toastT); toastT = setTimeout(() => el.classList.remove("show"), 2200); }
 
 document.addEventListener("click", ev => {
+  if (suppressClick) return;
   const b = ev.target.closest("[data-act]"); if (!b) return;
   const a = b.dataset.act, v = b.dataset.v, dd = +b.dataset.d;
   switch (a) {
@@ -1078,6 +1082,50 @@ document.addEventListener("click", ev => {
   }
   saveT(); render(); closeSheet();
 });
+
+/* ================= swipe down to close sheets ================= */
+(function sheetDrag() {
+  const sh = $("sheet"), shade = $("shade");
+  let y0 = null, dy = 0, t0 = 0, dragging = false;
+  const start = (y, target) => {
+    if (!sh.classList.contains("open")) return;
+    if (target.closest("#map, input, select, textarea, .leaflet-container")) return;   // let maps and fields work
+    if (!target.closest(".grab-zone") && sh.scrollTop > 2) return;                      // mid-scroll: drag the handle
+    y0 = y; dy = 0; t0 = Date.now(); dragging = false;
+  };
+  const move = (y, ev) => {
+    if (y0 === null) return;
+    dy = y - y0;
+    if (!dragging) {
+      if (dy > 6) { dragging = true; sh.style.transition = "none"; shade.style.transition = "none"; }
+      else if (dy < -6) { y0 = null; return; }   // swiping up = normal scrolling
+      else return;
+    }
+    if (ev.cancelable) ev.preventDefault();
+    sh.style.transform = `translateY(${Math.max(0, dy)}px)`;
+    shade.style.opacity = String(Math.max(0, 1 - dy / sh.offsetHeight));
+  };
+  const end = () => {
+    if (y0 === null) return;
+    const speed = dy / Math.max(1, Date.now() - t0);   // px per ms
+    sh.style.transition = shade.style.transition = "";
+    sh.style.transform = shade.style.opacity = "";
+    if (dragging && (dy > Math.min(110, sh.offsetHeight * 0.25) || speed > 0.6)) {
+      closeSheet();
+      suppressClick = true; setTimeout(() => { suppressClick = false; }, 350);
+    }
+    y0 = null; dragging = false;
+  };
+  sh.addEventListener("touchstart", e => { if (e.touches.length === 1) start(e.touches[0].clientY, e.target); }, { passive: true });
+  sh.addEventListener("touchmove", e => move(e.touches[0].clientY, e), { passive: false });
+  sh.addEventListener("touchend", end);
+  sh.addEventListener("touchcancel", end);
+  // mouse (desktop): drag the handle
+  sh.addEventListener("mousedown", e => { if (e.target.closest(".grab-zone")) start(e.clientY, e.target); });
+  window.addEventListener("mousemove", e => move(e.clientY, e));
+  window.addEventListener("mouseup", end);
+})();
+let suppressClick = false;
 
 /* ================= go ================= */
 (function safeAreaFallback() {
