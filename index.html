@@ -125,7 +125,14 @@
   .lbl { font-size: clamp(13px, 3.8vw, 16px); color: var(--muted); font-weight: 500; }
   .count { font-size: clamp(44px, 15vw, 80px); font-weight: 600; letter-spacing: -.02em; font-variant-numeric: tabular-nums; line-height: 1.05; margin: 4px 0 2px; }
   .at { font-size: clamp(13px, 3.8vw, 16px); color: var(--text); }
-  .what { margin-top: 8px; font-size: 12.5px; color: var(--muted); max-width: 100%; }
+  .route-row { display: flex; align-items: center; gap: 6px; margin-top: 10px; max-width: 100%; }
+  .route-chip { border: 1px solid var(--line); background: var(--card); border-radius: 999px; padding: 6px 12px; font-size: 12.5px;
+    color: var(--text); cursor: pointer; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .route-chip::after { content: " ›"; color: var(--muted); }
+  .route-chip:empty { display: none; }
+  .recalc { flex: none; width: 30px; height: 30px; border-radius: 50%; border: 1px solid var(--line); background: var(--card); color: var(--muted); cursor: pointer; font-size: 15px; line-height: 1; }
+  .recalc.spin { animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
   .steps { display: flex; gap: 6px; margin-top: 12px; }
   .steps i { width: 7px; height: 7px; border-radius: 50%; background: var(--line); }
   .steps i.done { background: var(--muted); }
@@ -239,7 +246,10 @@
         <div class="lbl" id="lbl">Loading…</div>
         <div class="count" id="count">--:--</div>
         <div class="at" id="at"></div>
-        <div class="what" id="what"></div>
+        <div class="route-row">
+          <button class="route-chip" id="what" data-act="route" aria-label="Route options"></button>
+          <button class="recalc" id="recalc" data-act="recalc" aria-label="Recalculate">↻</button>
+        </div>
         <div class="warn" id="warn"></div>
         <div class="steps" id="steps"></div>
       </div>
@@ -283,14 +293,14 @@ const DEFAULTS = {
   hub: "auto",
   drive: Object.fromEntries(Object.keys(HUBS).map(h => [h, 10])),
   park: Object.fromEntries(Object.keys(HUBS).map(h => [h, 5])),
-  startId: null,   // usual starting point from the library (null = drive minutes set by hand)
+  startId: "here", // usual starting point: "here" = current location, a library id, or null = minutes by hand
   walkAdj: {},     // per-place +/- minutes on the last leg
   links: [],       // setup links already applied
   buffer: 2,       // be at the stop this early
   cushion: 1,      // arrive at least this early
   carWalk: 3       // stop -> car on the way back
 };
-const BUILD = "20261108145447";   // replaced with a timestamp by publish.sh
+const BUILD = "20261108150451";   // replaced with a timestamp by publish.sh
 const DEV = !/^\d+$/.test(BUILD);
 const SCHED = BUNDLED_SCHEDULE || { routes: {}, stops: {}, feed_info: {} };
 
@@ -313,7 +323,7 @@ function loadSettings() {
 // Library: places and starting points you've entered. Kept when you "Start over", so you can pick them again.
 function loadLib() {
   const l = store.get("startnow.library", null) || {};
-  const lib = { places: Array.isArray(l.places) ? l.places : [], starts: Array.isArray(l.starts) ? l.starts : [] };
+  const lib = { places: Array.isArray(l.places) ? l.places : [], starts: Array.isArray(l.starts) ? l.starts : [], here: l.here && l.here.drive ? l.here : null };
   const old = (store.get("startnow.settings", {}) || {}).places;   // older versions kept places in settings
   if (Array.isArray(old)) old.forEach(p => { if (!lib.places.some(x => x.id === p.id)) lib.places.push(p); });
   return lib;
@@ -392,8 +402,40 @@ function legs(dir, fromSet, toId) {
   legCache.set(ck, out);
   return out;
 }
-const currentStart = () => LIB.starts.find(x => x.id === eff("startId")) || null;
-const startName = () => { const st = currentStart(); return st ? st.name : "Home"; };
+// "here" = your current location, refreshed every time the app opens and when you tap ↻.
+let hereState = "idle";   // idle | finding | ok | off
+const currentStart = () => {
+  const id = eff("startId");
+  if (id === "here") return LIB.here ? { id: "here", name: "Current location", drive: LIB.here.drive } : null;
+  return LIB.starts.find(x => x.id === id) || null;
+};
+const startName = () => eff("startId") === "here" ? "Current location" : (currentStart() || { name: "Home" }).name;
+function refreshHere(manual) {
+  if (eff("startId") !== "here") { if (manual) render(); return Promise.resolve(); }
+  if (!navigator.geolocation || !window.isSecureContext) { hereState = "off"; render(); return Promise.resolve(); }
+  hereState = "finding"; render();
+  return new Promise(done => navigator.geolocation.getCurrentPosition(async pos => {
+    const geo = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+    try {
+      // Same spot as last time (within 200 m)? Reuse the drive times; otherwise ask for new ones.
+      if (!LIB.here || dist(LIB.here, geo) > 200 || manual) {
+        const drive = await drivesFrom(geo.lat, geo.lon);
+        LIB.here = { lat: geo.lat, lon: geo.lon, drive, label: await nearbyLabel(geo) };
+      }
+      LIB.here.at = Date.now(); saveLib(); hereState = "ok";
+    } catch (e) { hereState = LIB.here ? "ok" : "off"; if (manual) toast("Couldn't update drive times. Check your connection."); }
+    render(); done();
+  }, err => {
+    hereState = "off"; render(); done();
+    if (manual) locationHelp(err.code === 1 ? "denied" : err.code === 3 ? "timeout" : "unavailable", `code ${err.code}${err.message ? ": " + err.message : ""}`);
+  }, { enableHighAccuracy: false, timeout: 15000, maximumAge: 2 * 60 * 1000 }));
+}
+function hereNote() {
+  if (eff("startId") !== "here") return "";
+  if (hereState === "finding") return "Finding you…";
+  if (hereState === "off") return LIB.here ? "Location off · last known spot" : "Location off · using ⚙︎ minutes";
+  return LIB.here && LIB.here.label ? shortAddr(LIB.here.label) : "";
+}
 function driveMin(hub) {
   const st = currentStart();
   const base = (T.live && T.live[hub] != null) ? T.live[hub] : (st && st.drive[hub] != null) ? st.drive[hub] : S.drive[hub];
@@ -488,11 +530,11 @@ function plan() {
     const lbl = routeLabel(trip.route);
     const last = trip.far ? `then about ${trip.walk} min to ${name}` : `walk ${trip.walk} min`;
     events = m === "out" ? [
-      { t: trip.leave, lbl: "Leave home in", what: `Drive ${driveMin(hubId)} min to ${hub.short}` },
-      { t: trip.dep, lbl: `${lbl} leaves in`, what: stopName(trip.from) },
+      { t: trip.leave, lbl: "Leave in", what: `🚗 ${driveMin(hubId)} min → ${hub.short}` },
+      { t: trip.dep, lbl: `${lbl} leaves in`, what: `${stopName(trip.from)} → ${stopName(trip.to)}` },
       { t: trip.arrive, lbl: `Arrive ${name} in`, what: `Off at ${stopName(trip.to)}, ${last}` }
     ] : [
-      { t: trip.leave, lbl: `Leave ${name} in`, what: trip.far ? `About ${trip.walk} min to ${stopName(trip.from)}` : `Walk ${trip.walk} min to ${stopName(trip.from)}` },
+      { t: trip.leave, lbl: "Leave in", what: `${trip.far ? "About" : "🚶"} ${trip.walk} min → ${stopName(trip.from)}` },
       { t: trip.dep, lbl: `${lbl} leaves in`, what: `${stopName(trip.from)} → ${hub.short}` },
       { t: trip.arr, lbl: `Off at ${hub.short} in`, what: `${bayOf(trip.to)} · walk to car` },
       { t: trip.home, lbl: "Home in", what: `Drive ${driveMin(hubId)} min` }
@@ -519,8 +561,11 @@ function render() {
   $("mRet").classList.toggle("on", m === "ret");
   const hereOn = T.startId !== undefined || !!T.live;
   if (m === "out") {
-    setCorner("cTL", "From", T.live ? "Live (Shortcut)" : startName(),
-      `${driveMin(hubId)} min drive${T.traffic ? " (+" + T.traffic + " traffic)" : ""}`, "from", hereOn || T.traffic);
+    const isHere = eff("startId") === "here" && !T.live;
+    const street = isHere && LIB.here && LIB.here.label ? shortAddr(LIB.here.label).split(",")[0] : "";
+    const hereSub = hereState === "finding" ? "Finding you…" : hereState === "off" ? (LIB.here ? "Last known spot" : "Location off") : "Current location";
+    setCorner("cTL", "From", T.live ? "Live (Shortcut)" : isHere ? "📍 " + (street || "Here") : startName(),
+      [isHere ? hereSub : "", `${driveMin(hubId)} min${isHere ? "" : " drive"}${T.traffic ? " +" + T.traffic : ""}`].filter(Boolean).join(" · "), "from", hereOn || T.traffic);
     setCorner("cTR", "To", name, "by " + fmt(hm(eff("arriveBy"))), "to", T.dest || T.arriveBy);
     setCorner("cBL", "Park & board", hub.short,
       trip ? (hub.name.startsWith(bayOf(trip.from)) ? "" : bayOf(trip.from) + " · ") + "park " + fmt(trip.dep - S.park[hubId] - S.buffer) : "—", "hub", T.hub);
@@ -549,7 +594,7 @@ function tick() {
     $("lbl").textContent = "No trips found";
     $("count").textContent = "--:--";
     $("at").textContent = cap(dayType()) + " schedule";
-    $("what").textContent = "Try another place or stop"; $("warn").textContent = ""; $("steps").innerHTML = "";
+    $("what").textContent = "Route options"; $("warn").textContent = ""; $("steps").innerHTML = "";
     arc.style.strokeDashoffset = CIRC; return;
   }
   const i = ev.findIndex(e => e.t > n);
@@ -557,7 +602,7 @@ function tick() {
     $("lbl").textContent = P.m === "out" ? "You should be there" : "You should be home";
     $("count").textContent = "✓";
     $("at").textContent = fmt(ev[ev.length - 1].t);
-    $("what").textContent = P.m === "out" ? "Tap “Back” for the trip home" : "";
+    $("what").textContent = P.m === "out" ? "Trip home" : "";
     $("warn").textContent = "";
     arc.style.stroke = "var(--muted)"; arc.style.strokeDashoffset = 0;
     renderSteps(ev.length); return;
@@ -568,6 +613,7 @@ function tick() {
   $("count").textContent = countdown(left);
   $("at").textContent = "at " + fmt(e.t);
   $("what").textContent = e.what;
+  $("recalc").classList.toggle("spin", hereState === "finding");
   const mins = left / 60;
   arc.style.stroke = i === 0 ? (mins > 10 ? "var(--go)" : mins > 3 ? "var(--soon)" : "var(--late)") : "var(--accent)";
   arc.style.strokeDashoffset = CIRC * (1 - Math.min(1, (e.t - n) / span));
@@ -647,7 +693,9 @@ async function searchPlaces(q) {
 
 function startRows(act, cur) {
   const hubId = P ? P.hubId : "rtc";
-  const rows = LIB.starts.slice().sort((x, y) => (y.at || 0) - (x.at || 0)).map(st => `<div class="opt-row">
+  const here = `<button class="opt ${cur === "here" ? "on" : ""}" data-act="${act}" data-v="here"><span><div class="t">📍 Current location</div>
+      <div class="d">${LIB.here ? esc(shortAddr(LIB.here.label || "Near you")) + " · " + (LIB.here.drive[hubId] ?? "?") + " min to " + HUBS[hubId].short : "Updates every time you open the app"}</div></span></button>`;
+  const rows = here + LIB.starts.slice().sort((x, y) => (y.at || 0) - (x.at || 0)).map(st => `<div class="opt-row">
       <button class="opt ${cur === st.id ? "on" : ""}" data-act="${act}" data-v="${esc(st.id)}">
         <span><div class="t">${esc(st.name)}</div><div class="d">${st.drive[hubId] != null ? st.drive[hubId] + " min to " + HUBS[hubId].short : ""}</div></span>
       </button><button class="x" data-act="delStart" data-v="${esc(st.id)}" aria-label="Remove">×</button></div>`).join("");
@@ -660,13 +708,38 @@ function sheetFrom() {
     ${m === "out" ? `
       ${startRows("start", eff("startId"))}
       <div class="chips" style="margin:4px 0 2px">
-        <button class="chip" data-act="startHere">📍 Where I am now</button>
         <button class="chip" data-act="startTyped">Type an address</button>
+        ${LIB.here ? `<button class="chip" data-act="saveHere">Save current spot</button>` : ""}
       </div>
       <p class="note">Picks are for today only.${T.startId !== undefined && T.startId !== S.startId ? ` <button class="link inline" data-act="usualStart">Make ${esc(startName())} my usual</button>` : ""}</p>` : ""}
     <h3>Traffic today</h3>
     <div class="chips">${[0, 5, 10, 15].map(x => `<button class="chip ${(T.traffic || 0) === x ? "on" : ""}" data-act="traffic" data-v="${x}">${x ? "+" + x + " min" : "Normal"}</button>`).join("")}</div>
     <p class="note">Adds time to the drive. Resets tomorrow.</p>`);
+}
+
+// Every way to get there: one best option per park & ride, ranked by how late you can leave.
+function sheetRoute() {
+  const m = mode();
+  if (m === "ret") { sheetBus(); return; }
+  const n = nowMin(), savedHub = T.hub;
+  const rows = Object.keys(HUBS).map(h => { T.hub = h; const o = options("out"); return o.trips.length ? { h, t: o.trips[o.base] } : null; }).filter(Boolean);
+  T.hub = savedHub;
+  rows.sort((a, b) => (b.t.ok - a.t.ok) || (b.t.leave - a.t.leave));
+  const cur = P.trip;
+  openSheet(`
+    <h2>Route options</h2>
+    <div class="field" style="padding-top:0"><label>${esc(startName())} → ${esc(P.name)}<small>${hereNote() ? esc(hereNote()) + " · " : ""}arrive by ${fmt(hm(eff("arriveBy")))}</small></label>
+      <button class="chip" data-act="recalc">↻ Recalculate</button></div>
+    <button class="opt ${eff("hub") === "auto" ? "on" : ""}" data-act="hub" data-v="auto"><span><div class="t">Pick for me</div><div class="d">Always the option that lets me leave latest</div></span></button>
+    ${rows.map(({ h, t }, i) => {
+      const tag = i === 0 && t.ok ? `<span class="tag ok">Best</span>` : t.leave < n ? `<span class="tag gone">Gone</span>` : !t.ok ? `<span class="tag bad">Late</span>` : "";
+      const on = cur && cur.hubId === h && eff("hub") !== "auto";
+      return `<button class="opt ${on ? "on" : ""}" data-act="pickRoute" data-h="${h}" data-v="${t.dep}" data-r="${esc(t.route)}">
+        <span><div class="t">Leave ${fmt(t.leave)} · ${HUBS[h].short}</div>
+        <div class="d">🚗 ${driveMin(h)} min · ${esc(routeLabel(t.route))} ${fmt(t.dep)} from ${esc(bayOf(t.from))} · arrive ${fmt(t.arrive)}</div></span>${tag}</button>`;
+    }).join("") || '<p class="note">Nothing to this place on today’s schedule.</p>'}
+    <button class="link" data-act="busList">Other times from ${esc(P.hub.short)}</button>
+    <p class="note">Your pick is for today only.</p>`);
 }
 
 function sheetHub() {
@@ -675,7 +748,7 @@ function sheetHub() {
   const rows = Object.keys(HUBS).map(h => {
     T.hub = h; const o = options(m); const t = o.trips[o.base];
     const d = !t ? "Nothing to this place today" : m === "out"
-      ? `Leave home ${fmt(t.leave)} · ${routeLabel(t.route)} ${fmt(t.dep)}${t.ok ? "" : " · late"}`
+      ? `Leave ${fmt(t.leave)} · ${routeLabel(t.route)} ${fmt(t.dep)}${t.ok ? "" : " · late"}`
       : `${routeLabel(t.route)} gets in ${fmt(t.arr)} · home ${fmt(t.home)}`;
     return `<button class="opt ${cur === h ? "on" : ""}" data-act="hub" data-v="${h}" ${t ? "" : "disabled"}>
       <span><div class="t">${HUBS[h].name}</div><div class="d">${d}</div></span></button>`;
@@ -683,7 +756,7 @@ function sheetHub() {
   T.hub = savedT;
   openSheet(`<h2>${m === "out" ? "Where to park & board" : "Where is your car?"}</h2>
     <button class="opt ${cur === "auto" ? "on" : ""}" data-act="hub" data-v="auto"><span><div class="t">${m === "out" ? "Pick for me" : "Where I parked this morning"}</div>
-      <div class="d">${m === "out" ? "Whichever lets me leave home latest" : (T.parked ? HUBS[T.parked].name : "Best option")}</div></span></button>
+      <div class="d">${m === "out" ? "Whichever lets me leave latest" : (T.parked ? HUBS[T.parked].name : "Best option")}</div></span></button>
     ${rows}<p class="note">For today only. Your usual is in ⚙︎.</p>`);
 }
 
@@ -694,7 +767,7 @@ function sheetBus() {
     const i = from + k;
     const tag = i === opts.base ? `<span class="tag ok">Best</span>` : t.leave < n ? `<span class="tag gone">Gone</span>`
       : !t.ok ? `<span class="tag bad">${m === "out" ? "Late" : "Before " + fmt(hm(eff("leaveAt")))}</span>` : "";
-    const d = m === "out" ? `${HUBS[t.hubId].short} · leave home ${fmt(t.leave)} · arrive ${fmt(t.arrive)}`
+    const d = m === "out" ? `${HUBS[t.hubId].short} · leave ${fmt(t.leave)} · arrive ${fmt(t.arrive)}`
       : `${esc(stopName(t.from))} · leave ${fmt(t.leave)} · home ${fmt(t.home)}`;
     return `<button class="opt ${i === idx ? "on" : ""}" data-act="bus" data-v="${t.dep}" data-r="${esc(t.route)}" data-h="${t.hubId}">
       <span><div class="t">${fmt(t.dep)} · ${esc(routeLabel(t.route))}</div><div class="d">${d}</div></span>${tag}</button>`;
@@ -709,16 +782,16 @@ function sheetSettings(welcome) {
   const expired = fi.end_date && new Date(end) < new Date();
   openSheet(`
     ${welcome ? `<h2>Set up once</h2><p class="note" style="margin-top:0">Everything stays on this phone.</p>` : `<h2>My usual</h2>`}
-    ${welcome && LIB.starts.length ? `<h3>Start from a saved place</h3>${startRows("usualStartPick", S.startId)}` : ""}
+    ${welcome ? `<h3>Usually start from</h3>${startRows("usualStartPick", S.startId)}` : ""}
     <button class="opt" data-act="measureHome"><span><div class="t">📍 I'm at home: measure my drive times</div>
       <div class="d">Uses your location once and saves it as “Home” on this phone.</div></span></button>
     <button class="link" data-act="typeAddress" style="padding:0 0 6px">Or type your address instead</button>
-    ${!welcome && LIB.starts.length ? `<div class="field"><label>Starting from</label><select id="sStart"><option value="">Minutes set by hand</option>${LIB.starts.map(st => `<option value="${esc(st.id)}" ${S.startId === st.id ? "selected" : ""}>${esc(st.name)}</option>`).join("")}</select></div>` : ""}
+    ${!welcome ? `<div class="field"><label>Starting from</label><select id="sStart"><option value="here" ${S.startId === "here" ? "selected" : ""}>Current location</option><option value="" ${!S.startId ? "selected" : ""}>Minutes set by hand</option>${LIB.starts.map(st => `<option value="${esc(st.id)}" ${S.startId === st.id ? "selected" : ""}>${esc(st.name)}</option>`).join("")}</select></div>` : ""}
     <div class="field"><label>Arrive by</label><input type="time" id="sArrive" value="${S.arriveBy}"></div>
     <div class="field"><label>Leave there at</label><input type="time" id="sLeave" value="${S.leaveAt}"></div>
     <div class="field"><label>Going to<small>Add places from the “To” corner</small></label><select id="sDest">${allPlaces().map(p => `<option value="${esc(p.id)}" ${S.dest === p.id ? "selected" : ""}>${esc(p.short || p.name)}</option>`).join("")}</select></div>
     <div class="field"><label>Park & board at</label><select id="sHub">${[["auto", "Pick for me"]].concat(Object.entries(HUBS).map(([id, h]) => [id, h.short])).map(([id, nm]) => `<option value="${id}" ${S.hub === id ? "selected" : ""}>${nm}</option>`).join("")}</select></div>
-    <h3>Drive from ${esc(S.startId && LIB.starts.some(x => x.id === S.startId) ? LIB.starts.find(x => x.id === S.startId).name : "home")}</h3>
+    <h3>${S.startId === "here" ? "Drive minutes (used when location is off)" : "Drive from " + esc(S.startId && LIB.starts.some(x => x.id === S.startId) ? LIB.starts.find(x => x.id === S.startId).name : "home")}</h3>
     ${Object.entries(HUBS).map(([id, h]) => `<div class="field"><label>${h.short}</label>${stepper("sDrive", usualDrive()[id], " min", `data-h="${id}"`)}</div>`).join("")}
     <h3>Park & walk to the platform</h3>
     ${Object.entries(HUBS).map(([id, h]) => `<div class="field"><label>${h.short}</label>${stepper("sPark", S.park[id], " min", `data-h="${id}"`)}</div>`).join("")}
@@ -737,7 +810,7 @@ function sheetSettings(welcome) {
   bind("sLeave", v => { if (v) S.leaveAt = v; });
   bind("sDest", v => { S.dest = v; });
   bind("sHub", v => { S.hub = v; });
-  if ($("sStart")) bind("sStart", v => { S.startId = v || null; });
+  if ($("sStart")) bind("sStart", v => { S.startId = v || null; delete T.hub; clearPins(); saveT(); if (S.startId === "here") refreshHere(); });
 }
 
 /* ================= map + step-by-step ================= */
@@ -780,7 +853,7 @@ function timeline() {
   const li = (cls, tm, title, sub, soft) =>
     `<li class="${cls}"><span class="tm ${soft ? "soft" : ""}">${tm}</span><span class="dot"></span><span class="tx"><b>${esc(title)}</b>${sub ? `<span>${esc(sub)}</span>` : ""}</span></li>`;
   const rows = m === "out" ? [
-    li("drive", fmt(t.leave), "Leave " + startName(), `Drive ${driveMin(hubId)} min`),
+    li("drive", fmt(t.leave), eff("startId") === "here" ? "Leave from where you are" : "Leave " + startName(), `Drive ${driveMin(hubId)} min to ${hub.short}`),
     li("walk", fmt(t.dep - S.park[hubId] - S.buffer), `Park at ${hub.name}`, `Walk ${S.park[hubId]} min, be there ${S.buffer} min early`),
     li("ride", fmt(t.dep), `${lbl} from ${stopName(t.from)}`, `${ride} min ride`),
     li("walk", fmt(t.arr), `Get off at ${stopName(t.to)}`, lastLeg),
@@ -1032,7 +1105,16 @@ document.addEventListener("click", ev => {
     case "settings": sheetSettings(); return;
     case "to": sheetTo(); return;
     case "from": sheetFrom(); return;
-    case "hub": if (v === undefined) { sheetHub(); return; } T.hub = v === S.hub ? undefined : v; clearPins(); break;
+    case "hub": if (v === undefined) { mode() === "out" ? sheetRoute() : sheetHub(); return; } T.hub = v === S.hub ? undefined : v; clearPins(); break;
+    case "route": sheetRoute(); return;
+    case "busList": sheetBus(); return;
+    case "pickRoute": T.hub = b.dataset.h; T.bus_out = { dep: +v, route: b.dataset.r, hub: b.dataset.h, dest: eff("dest") }; break;
+    case "recalc": {
+      $("recalc").classList.add("spin"); legCache.clear(); clearPins(); saveT();
+      refreshHere(true).then(() => { render(); checkForUpdate(); toast("Recalculated " + fmt(nowMin())); if ($("sheet").classList.contains("open") && $("sheetBody").querySelector("[data-act=pickRoute]")) sheetRoute(); });
+      return;
+    }
+    case "saveHere": if (LIB.here) { const st = saveStart(LIB.here.drive, LIB.here, LIB.here.label); toast("Saved " + st.name); sheetFrom(); } return;
     case "bus": if (v === undefined) { sheetBus(); return; }
       T["bus_" + P.m] = { dep: +v, route: b.dataset.r, hub: b.dataset.h, dest: eff("dest") }; break;
     case "dest": T.dest = v === S.dest ? undefined : v; clearPins(); saveT(); render(); sheetTo(); return;
@@ -1053,11 +1135,14 @@ document.addEventListener("click", ev => {
     case "walk": { const id = P.place.id; S.walkAdj[id] = (S.walkAdj[id] || 0) + dd; legCache.clear(); saveS(); render(); sheetTo(); return; }
     case "nudge": { const k = b.dataset.k; T[k] = hmStr(hm(eff(k)) + dd); clearPins(); saveT(); render(); sheetTo(); return; }
     case "resetToday": b.dataset.k.split(",").forEach(k => delete T[k]); clearPins(); saveT(); render(); sheetTo(); return;
-    case "start": T.startId = (v || null) === (S.startId || null) ? undefined : (v || null); delete T.live; break;
+    case "start":
+      // New starting point: forget today's park & ride / bus picks so the best route is chosen again.
+      T.startId = (v || null) === (S.startId || null) ? undefined : (v || null); delete T.live; delete T.hub; clearPins();
+      saveT(); render(); closeSheet(); if (eff("startId") === "here") refreshHere(); return;
     case "startHere": measureDrives(useToday); return;
     case "startTyped": pendingDrives = useToday; locationHelp("typed"); return;
     case "usualStart": S.startId = eff("startId"); delete T.startId; saveS(); saveT(); render(); sheetFrom(); toast("Saved as your usual"); return;
-    case "usualStartPick": S.startId = v || null; saveS(); render(); sheetSettings(true); return;
+    case "usualStartPick": S.startId = v || null; saveS(); render(); sheetSettings(true); if (S.startId === "here") refreshHere(); return;
     case "delStart":
       LIB.starts = LIB.starts.filter(x => x.id !== v); saveLib();
       if (S.startId === v) S.startId = null;
@@ -1077,7 +1162,7 @@ document.addEventListener("click", ev => {
     case "forgetAll":
       if (!confirm("Forget everything on this phone, including saved places and addresses? This can't be undone.")) return;
       ["startnow.settings", "startnow.today", "startnow.library"].forEach(k => { try { localStorage.removeItem(k); } catch (e) {} });
-      S = loadSettings(); LIB = { places: [], starts: [] }; T = { date: todayKey() }; saveS(); saveLib(); saveT(); legCache.clear(); render(); sheetSettings(true); return;
+      S = loadSettings(); LIB = { places: [], starts: [], here: null }; T = { date: todayKey() }; saveS(); saveLib(); saveT(); legCache.clear(); render(); sheetSettings(true); return;
     default: return;
   }
   saveT(); render(); closeSheet();
@@ -1142,10 +1227,11 @@ render();
 if (FIRST_RUN) sheetSettings(true);
 setInterval(tick, 1000);
 setInterval(() => { if (T.date !== todayKey()) { T = loadToday(); legCache.clear(); } render(); }, 30000);
-document.addEventListener("visibilitychange", () => { if (!document.hidden) { T = loadToday(); legCache.clear(); render(); checkForUpdate(); } });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { T = loadToday(); legCache.clear(); render(); checkForUpdate(); refreshHere(); } });
 window.addEventListener("pageshow", e => { if (e.persisted) checkForUpdate(); });
 if ("serviceWorker" in navigator && location.protocol === "https:") navigator.serviceWorker.register("sw.js").catch(() => {});
 checkForUpdate();
+if (!FIRST_RUN) refreshHere();
 if (/[?&]fresh=/.test(location.search)) { history.replaceState(null, "", location.pathname); setTimeout(() => toast("Reloaded the latest version"), 400); }
 try { const u = sessionStorage.getItem("startnow.updated"); if (u) { sessionStorage.removeItem("startnow.updated"); setTimeout(() => toast("Updated to the latest version"), 400); } } catch (e) {}
 </script>
