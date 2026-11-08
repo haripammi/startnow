@@ -179,6 +179,8 @@
   .search { display: flex; gap: 8px; margin-bottom: 10px; }
   .search input { flex: 1; min-width: 0; font: inherit; font-size: 16px; color: var(--text); background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 9px 12px; }
   .opt.result { border-style: dashed; }
+  .steps-help { margin: 6px 0 14px; padding-left: 20px; font-size: 14px; line-height: 1.5; }
+  .steps-help li { margin-bottom: 4px; }
   .link.inline { padding: 0; font-size: inherit; }
   a.link { display: inline-block; text-decoration: none; }
   .link { border: 0; background: none; color: var(--accent); padding: 12px 0 0; cursor: pointer; font-size: 14px; }
@@ -670,6 +672,7 @@ function sheetSettings(welcome) {
     ${welcome ? `<h2>Set up once</h2><p class="note" style="margin-top:0">Everything stays on this phone.</p>` : `<h2>My usual</h2>`}
     <button class="opt" data-act="measureHome"><span><div class="t">📍 I'm at home: measure my drive times</div>
       <div class="d">Uses your location once. Only the minutes are saved, not where you live.</div></span></button>
+    <button class="link" data-act="typeAddress" style="padding:0 0 6px">Or type your address instead</button>
     <div class="field"><label>Arrive by</label><input type="time" id="sArrive" value="${S.arriveBy}"></div>
     <div class="field"><label>Leave there at</label><input type="time" id="sLeave" value="${S.leaveAt}"></div>
     <div class="field"><label>Going to<small>Add places from the “To” corner</small></label><select id="sDest">${allPlaces().map(p => `<option value="${esc(p.id)}" ${S.dest === p.id ? "selected" : ""}>${esc(p.short || p.name)}</option>`).join("")}</select></div>
@@ -811,20 +814,60 @@ function drawMap() {
 }
 
 /* ================= location → drive times ================= */
+async function drivesFrom(la, lo) {
+  const out = {};
+  await Promise.all(Object.entries(HUBS).map(async ([id, h]) => {
+    const j = await (await fetch(`https://router.project-osrm.org/route/v1/driving/${lo},${la};${h.lon},${h.lat}?overview=false`)).json();
+    out[id] = Math.max(1, Math.ceil(j.routes[0].duration / 60 * 1.15)); // small allowance for traffic
+  }));
+  return out;
+}
+let pendingDrives = null;   // what to do with drive times once we get them (for "Try again" / typed address)
 function measureDrives(onDone) {
-  if (!navigator.geolocation) { toast("Location isn't available here"); return; }
+  pendingDrives = onDone;
+  if (!navigator.geolocation || !window.isSecureContext) { locationHelp("unavailable"); return; }
   toast("Finding you…");
   navigator.geolocation.getCurrentPosition(async pos => {
-    const { latitude: la, longitude: lo } = pos.coords;
-    try {
-      const out = {};
-      await Promise.all(Object.entries(HUBS).map(async ([id, h]) => {
-        const j = await (await fetch(`https://router.project-osrm.org/route/v1/driving/${lo},${la};${h.lon},${h.lat}?overview=false`)).json();
-        out[id] = Math.max(1, Math.ceil(j.routes[0].duration / 60 * 1.15)); // small allowance for traffic
-      }));
-      onDone(out);
-    } catch (e) { toast("Couldn't get drive times"); }
-  }, () => toast("Location permission denied"), { enableHighAccuracy: false, timeout: 10000 });
+    try { onDone(await drivesFrom(pos.coords.latitude, pos.coords.longitude)); }
+    catch (e) { toast("Couldn't get drive times. Check your connection."); }
+  }, err => locationHelp(err.code === 1 ? "denied" : err.code === 3 ? "timeout" : "unavailable"),
+  { enableHighAccuracy: false, timeout: 20000, maximumAge: 10 * 60 * 1000 });
+}
+async function drivesFromAddress(q) {
+  q = (q || "").trim(); if (!q || !pendingDrives) return;
+  toast("Looking up…");
+  try {
+    const url = "https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&countrycodes=us&viewbox=-122.45,47.80,-121.85,47.45&bounded=1&q=" + encodeURIComponent(q);
+    const [hit] = await (await fetch(url, { headers: { "Accept-Language": "en" } })).json();
+    if (!hit) { toast("Couldn't find that address"); return; }
+    pendingDrives(await drivesFrom(+hit.lat, +hit.lon)); // only the minutes are kept, never the address
+  } catch (e) { toast("Couldn't look that up. Check your connection."); }
+}
+function locationHelp(kind) {
+  const msg = {
+    denied: `<p class="note" style="margin-top:0">Your iPhone is blocking location for websites. To turn it on:</p>
+      <ol class="steps-help">
+        <li><b>Settings → Privacy &amp; Security → Location Services</b>: on.</li>
+        <li>On the same screen, scroll to <b>Safari Websites</b> and pick <b>While Using the App</b>.</li>
+        <li>If you tapped “Don’t Allow” before: <b>Settings → Apps → Safari → Location</b> → <b>Ask</b>.</li>
+        <li>Come back here and tap <b>Try again</b>, then <b>Allow</b>.</li>
+      </ol>`,
+    timeout: `<p class="note" style="margin-top:0">Finding your location took too long. Try again, ideally on Wi-Fi or near a window.</p>`,
+    unavailable: `<p class="note" style="margin-top:0">Location isn't available right now.</p>`,
+    typed: ""
+  }[kind];
+  openSheet(`
+    <h2>${kind === "typed" ? "Your home address" : "Couldn't get your location"}</h2>
+    ${msg}
+    ${kind === "denied" || kind === "timeout" ? `<button class="chip on" data-act="retryLocation">Try again</button>` : ""}
+    ${kind === "typed" ? "" : "<h3>Or type your home address</h3>"}
+    <form class="search" id="addrForm">
+      <input type="search" id="addr" placeholder="Street address, city" autocomplete="street-address" enterkeyhint="go">
+      <button class="chip" type="submit">Use</button>
+    </form>
+    <p class="note">Used once to work out the drive times. Only the minutes are saved, never the address. You can also set the minutes by hand in ⚙︎.</p>
+  `);
+  $("addrForm").addEventListener("submit", ev => { ev.preventDefault(); drivesFromAddress($("addr").value); });
 }
 
 /* ================= setup links =================
@@ -891,6 +934,8 @@ document.addEventListener("click", ev => {
     case "start":
       if (v === "here") { measureDrives(here => { T.start = "here"; T.here = here; T.hereLabel = "Current location"; saveT(); render(); closeSheet(); toast("Drive times from here"); }); return; }
       T.start = "home"; delete T.here; break;
+    case "retryLocation": if (pendingDrives) measureDrives(pendingDrives); return;
+    case "typeAddress": pendingDrives = d => { S.drive = Object.assign({}, S.drive, d); saveS(); render(); sheetSettings(FIRST_RUN); toast("Drive times saved"); }; locationHelp("typed"); return;
     case "measureHome": measureDrives(d => { S.drive = Object.assign({}, S.drive, d); saveS(); render(); sheetSettings(FIRST_RUN); toast("Drive times saved"); }); return;
     case "traffic": T.traffic = +v || undefined; saveT(); render(); sheetFrom(); return;
     case "sDrive": S.drive[b.dataset.h] = Math.max(0, S.drive[b.dataset.h] + dd); saveS(); render(); sheetSettings(); return;
