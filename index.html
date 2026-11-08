@@ -272,7 +272,7 @@ const DEFAULTS = {
   hub: "auto",
   drive: Object.fromEntries(Object.keys(HUBS).map(h => [h, 10])),
   park: Object.fromEntries(Object.keys(HUBS).map(h => [h, 5])),
-  places: [],      // saved places {id, name, short, lat, lon} — only on this device
+  startId: null,   // usual starting point from the library (null = drive minutes set by hand)
   walkAdj: {},     // per-place +/- minutes on the last leg
   links: [],       // setup links already applied
   buffer: 2,       // be at the stop this early
@@ -294,12 +294,22 @@ function loadSettings() {
     drive: Object.assign({}, DEFAULTS.drive, s.drive || {}),
     park: Object.assign({}, DEFAULTS.park, s.park || {}),
     walkAdj: Object.assign({}, s.walkAdj || {}),
-    places: Array.isArray(s.places) ? s.places : [],
     links: Array.isArray(s.links) ? s.links : []
   });
 }
+// Library: places and starting points you've entered. Kept when you "Start over", so you can pick them again.
+function loadLib() {
+  const l = store.get("startnow.library", null) || {};
+  const lib = { places: Array.isArray(l.places) ? l.places : [], starts: Array.isArray(l.starts) ? l.starts : [] };
+  const old = (store.get("startnow.settings", {}) || {}).places;   // older versions kept places in settings
+  if (Array.isArray(old)) old.forEach(p => { if (!lib.places.some(x => x.id === p.id)) lib.places.push(p); });
+  return lib;
+}
 function loadToday() { const t = store.get("startnow.today", null); return t && t.date === todayKey() ? t : { date: todayKey() }; }
 let S = loadSettings();
+let LIB = loadLib();
+const saveLib = () => store.set("startnow.library", LIB);
+saveLib();
 let T = loadToday();          // "today only" changes, reset automatically tomorrow
 const saveS = () => store.set("startnow.settings", S);
 const saveT = () => store.set("startnow.today", T);
@@ -369,13 +379,16 @@ function legs(dir, fromSet, toId) {
   legCache.set(ck, out);
   return out;
 }
+const currentStart = () => LIB.starts.find(x => x.id === eff("startId")) || null;
+const startName = () => { const st = currentStart(); return st ? st.name : "Home"; };
 function driveMin(hub) {
-  const base = (eff("start") === "here" && T.here && T.here[hub] != null) ? T.here[hub] : S.drive[hub];
+  const st = currentStart();
+  const base = (T.live && T.live[hub] != null) ? T.live[hub] : (st && st.drive[hub] != null) ? st.drive[hub] : S.drive[hub];
   return base + (T.traffic || 0);
 }
 
 /* ================= places ================= */
-function allPlaces() { return BUILTIN_PLACES.concat(S.places || []); }
+function allPlaces() { return BUILTIN_PLACES.concat(LIB.places); }
 function placeById(id) { return allPlaces().find(p => p.id === id) || BUILTIN_PLACES[0]; }
 // Stops worth considering near a place: everything within a short walk of the nearest one.
 function candidateStops(place, dir) {
@@ -491,9 +504,9 @@ function render() {
   const { m, name, hub, hubId, trip } = P;
   $("mOut").classList.toggle("on", m === "out");
   $("mRet").classList.toggle("on", m === "ret");
-  const hereOn = eff("start") === "here";
+  const hereOn = T.startId !== undefined || !!T.live;
   if (m === "out") {
-    setCorner("cTL", "From", hereOn ? (T.hereLabel || "Current location") : "Home",
+    setCorner("cTL", "From", T.live ? "Live (Shortcut)" : startName(),
       `${driveMin(hubId)} min drive${T.traffic ? " (+" + T.traffic + " traffic)" : ""}`, "from", hereOn || T.traffic);
     setCorner("cTR", "To", name, "by " + fmt(hm(eff("arriveBy"))), "to", T.dest || T.arriveBy);
     setCorner("cBL", "Park & board", hub.short,
@@ -619,13 +632,25 @@ async function searchPlaces(q) {
   } catch (e) { box.innerHTML = `<p class="note">Search needs an internet connection.</p>`; }
 }
 
+function startRows(act, cur) {
+  const hubId = P ? P.hubId : "rtc";
+  const rows = LIB.starts.slice().sort((x, y) => (y.at || 0) - (x.at || 0)).map(st => `<div class="opt-row">
+      <button class="opt ${cur === st.id ? "on" : ""}" data-act="${act}" data-v="${esc(st.id)}">
+        <span><div class="t">${esc(st.name)}</div><div class="d">${st.drive[hubId] != null ? st.drive[hubId] + " min to " + HUBS[hubId].short : ""}</div></span>
+      </button><button class="x" data-act="delStart" data-v="${esc(st.id)}" aria-label="Remove">×</button></div>`).join("");
+  return rows + `<button class="opt ${!cur ? "on" : ""}" data-act="${act}" data-v=""><span><div class="t">Minutes set by hand</div><div class="d">Use the drive times in ⚙︎</div></span></button>`;
+}
 function sheetFrom() {
-  const m = mode(), here = eff("start") === "here";
+  const m = mode();
   openSheet(`
     <h2>${m === "out" ? "Starting from" : "Drive home"}</h2>
     ${m === "out" ? `
-      <button class="opt ${!here ? "on" : ""}" data-act="start" data-v="home"><span><div class="t">Home</div><div class="d">Your saved drive times</div></span></button>
-      <button class="opt ${here ? "on" : ""}" data-act="start" data-v="here"><span><div class="t">Where I am now</div><div class="d">Uses your location once, for today</div></span></button>` : ""}
+      ${startRows("start", eff("startId"))}
+      <div class="chips" style="margin:4px 0 2px">
+        <button class="chip" data-act="startHere">📍 Where I am now</button>
+        <button class="chip" data-act="startTyped">Type an address</button>
+      </div>
+      <p class="note">Picks are for today only.${T.startId !== undefined && T.startId !== S.startId ? ` <button class="link inline" data-act="usualStart">Make ${esc(startName())} my usual</button>` : ""}</p>` : ""}
     <h3>Traffic today</h3>
     <div class="chips">${[0, 5, 10, 15].map(x => `<button class="chip ${(T.traffic || 0) === x ? "on" : ""}" data-act="traffic" data-v="${x}">${x ? "+" + x + " min" : "Normal"}</button>`).join("")}</div>
     <p class="note">Adds time to the drive. Resets tomorrow.</p>`);
@@ -664,34 +689,41 @@ function sheetBus() {
   openSheet(`<h2>Trips · ${cap(dayType())} schedule</h2>${rows || '<p class="note">Nothing on this schedule.</p>'}`);
 }
 
+const usualDrive = () => { const st = LIB.starts.find(x => x.id === S.startId); return st ? st.drive : S.drive; };
 function sheetSettings(welcome) {
   const fi = SCHED.feed_info || {};
   const end = fi.end_date ? fi.end_date.replace(/(\d{4})(\d{2})(\d{2})/, "$1-$2-$3") : "?";
   const expired = fi.end_date && new Date(end) < new Date();
   openSheet(`
     ${welcome ? `<h2>Set up once</h2><p class="note" style="margin-top:0">Everything stays on this phone.</p>` : `<h2>My usual</h2>`}
+    ${welcome && LIB.starts.length ? `<h3>Start from a saved place</h3>${startRows("usualStartPick", S.startId)}` : ""}
     <button class="opt" data-act="measureHome"><span><div class="t">📍 I'm at home: measure my drive times</div>
-      <div class="d">Uses your location once. Only the minutes are saved, not where you live.</div></span></button>
+      <div class="d">Uses your location once and saves it as “Home” on this phone.</div></span></button>
     <button class="link" data-act="typeAddress" style="padding:0 0 6px">Or type your address instead</button>
+    ${!welcome && LIB.starts.length ? `<div class="field"><label>Starting from</label><select id="sStart"><option value="">Minutes set by hand</option>${LIB.starts.map(st => `<option value="${esc(st.id)}" ${S.startId === st.id ? "selected" : ""}>${esc(st.name)}</option>`).join("")}</select></div>` : ""}
     <div class="field"><label>Arrive by</label><input type="time" id="sArrive" value="${S.arriveBy}"></div>
     <div class="field"><label>Leave there at</label><input type="time" id="sLeave" value="${S.leaveAt}"></div>
     <div class="field"><label>Going to<small>Add places from the “To” corner</small></label><select id="sDest">${allPlaces().map(p => `<option value="${esc(p.id)}" ${S.dest === p.id ? "selected" : ""}>${esc(p.short || p.name)}</option>`).join("")}</select></div>
     <div class="field"><label>Park & board at</label><select id="sHub">${[["auto", "Pick for me"]].concat(Object.entries(HUBS).map(([id, h]) => [id, h.short])).map(([id, nm]) => `<option value="${id}" ${S.hub === id ? "selected" : ""}>${nm}</option>`).join("")}</select></div>
-    <h3>Drive from home</h3>
-    ${Object.entries(HUBS).map(([id, h]) => `<div class="field"><label>${h.short}</label>${stepper("sDrive", S.drive[id], " min", `data-h="${id}"`)}</div>`).join("")}
+    <h3>Drive from ${esc(S.startId && LIB.starts.some(x => x.id === S.startId) ? LIB.starts.find(x => x.id === S.startId).name : "home")}</h3>
+    ${Object.entries(HUBS).map(([id, h]) => `<div class="field"><label>${h.short}</label>${stepper("sDrive", usualDrive()[id], " min", `data-h="${id}"`)}</div>`).join("")}
     <h3>Park & walk to the platform</h3>
     ${Object.entries(HUBS).map(([id, h]) => `<div class="field"><label>${h.short}</label>${stepper("sPark", S.park[id], " min", `data-h="${id}"`)}</div>`).join("")}
     <h3>Cushions</h3>
     <div class="field"><label>Be at the stop early</label>${stepper("sBuffer", S.buffer, " min")}</div>
     <div class="field"><label>Arrive early by at least</label>${stepper("sCushion", S.cushion, " min")}</div>
     <p class="note">Routes: ${Object.keys(SCHED.routes || {}).map(routeLabel).join(", ")}. Timetable valid until ${end}.${expired ? ' <b style="color:var(--late)">Expired: reload when online for an update.</b>' : ""}</p>
-    ${welcome ? `<button class="chip on" data-act="close" style="margin-top:14px">Done</button>` : `<button class="link" data-act="resetAll">Reset everything</button>`}
+    ${welcome ? `<button class="chip on" data-act="close" style="margin-top:14px">Done</button>` : `
+    <h3>Start over</h3>
+    <button class="opt" data-act="startOver"><span><div class="t">Start over</div><div class="d">Resets times, stops and choices. Your ${LIB.places.length + LIB.starts.length} saved places and addresses stay, ready to pick again.</div></span></button>
+    <button class="link" data-act="forgetAll" style="color:var(--late)">Forget everything, including saved places</button>`}
   `);
   const bind = (id, fn) => $(id).addEventListener("change", ev => { fn(ev.target.value); saveS(); render(); });
   bind("sArrive", v => { if (v) S.arriveBy = v; });
   bind("sLeave", v => { if (v) S.leaveAt = v; });
   bind("sDest", v => { S.dest = v; });
   bind("sHub", v => { S.hub = v; });
+  if ($("sStart")) bind("sStart", v => { S.startId = v || null; });
 }
 
 /* ================= map + step-by-step ================= */
@@ -734,7 +766,7 @@ function timeline() {
   const li = (cls, tm, title, sub, soft) =>
     `<li class="${cls}"><span class="tm ${soft ? "soft" : ""}">${tm}</span><span class="dot"></span><span class="tx"><b>${esc(title)}</b>${sub ? `<span>${esc(sub)}</span>` : ""}</span></li>`;
   const rows = m === "out" ? [
-    li("drive", fmt(t.leave), eff("start") === "here" ? "Leave from here" : "Leave home", `Drive ${driveMin(hubId)} min`),
+    li("drive", fmt(t.leave), "Leave " + startName(), `Drive ${driveMin(hubId)} min`),
     li("walk", fmt(t.dep - S.park[hubId] - S.buffer), `Park at ${hub.name}`, `Walk ${S.park[hubId]} min, be there ${S.buffer} min early`),
     li("ride", fmt(t.dep), `${lbl} from ${stopName(t.from)}`, `${ride} min ride`),
     li("walk", fmt(t.arr), `Get off at ${stopName(t.to)}`, lastLeg),
@@ -828,10 +860,34 @@ function measureDrives(onDone) {
   if (!navigator.geolocation || !window.isSecureContext) { locationHelp("unavailable"); return; }
   toast("Finding you…");
   navigator.geolocation.getCurrentPosition(async pos => {
-    try { onDone(await drivesFrom(pos.coords.latitude, pos.coords.longitude)); }
+    const geo = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+    try { onDone(await drivesFrom(geo.lat, geo.lon), geo, await nearbyLabel(geo)); }
     catch (e) { toast("Couldn't get drive times. Check your connection."); }
   }, err => locationHelp(err.code === 1 ? "denied" : err.code === 3 ? "timeout" : "unavailable"),
   { enableHighAccuracy: false, timeout: 20000, maximumAge: 10 * 60 * 1000 });
+}
+// Short street name for a location, e.g. "NE 85th St, Redmond" (asks OpenStreetMap once).
+async function nearbyLabel(geo) {
+  try {
+    const j = await (await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=17&lat=${geo.lat}&lon=${geo.lon}`, { headers: { "Accept-Language": "en" } })).json();
+    const a = j.address || {};
+    const street = [a.house_number, a.road].filter(Boolean).join(" ");
+    const town = a.city || a.town || a.village || a.suburb || "";
+    return [street, town].filter(Boolean).join(", ") || null;
+  } catch (e) { return null; }
+}
+const shortAddr = t => t && t.replace(/\bNortheast\b/g, "NE").replace(/\bNorthwest\b/g, "NW").replace(/\bSoutheast\b/g, "SE").replace(/\bSouthwest\b/g, "SW")
+  .replace(/\bStreet\b/g, "St").replace(/\bAvenue\b/g, "Ave").replace(/\bPlace\b/g, "Pl").replace(/\bDrive\b/g, "Dr").replace(/\bRoad\b/g, "Rd").replace(/\bBoulevard\b/g, "Blvd").replace(/\bCourt\b/g, "Ct").replace(/\bWay\b(?=,|$)/g, "Way");
+// Save (or refresh) a starting point in the library. Points within 150 m of a saved one update it.
+function saveStart(drive, geo, name) {
+  let st = geo ? LIB.starts.find(x => x.lat != null && dist(x, geo) < 150) : null;
+  if (st) { st.drive = drive; st.at = Date.now(); }
+  else {
+    st = { id: "s" + Date.now().toString(36), name: shortAddr(name) || ("Saved " + new Date().toLocaleDateString([], { month: "short", day: "numeric" })),
+      lat: geo && geo.lat, lon: geo && geo.lon, drive, at: Date.now() };
+    LIB.starts.push(st);
+  }
+  saveLib(); return st;
 }
 async function drivesFromAddress(q) {
   q = (q || "").trim(); if (!q || !pendingDrives) return;
@@ -840,7 +896,9 @@ async function drivesFromAddress(q) {
     const url = "https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&countrycodes=us&viewbox=-122.45,47.80,-121.85,47.45&bounded=1&q=" + encodeURIComponent(q);
     const [hit] = await (await fetch(url, { headers: { "Accept-Language": "en" } })).json();
     if (!hit) { toast("Couldn't find that address"); return; }
-    pendingDrives(await drivesFrom(+hit.lat, +hit.lon)); // only the minutes are kept, never the address
+    const parts = hit.display_name.split(", ");
+    const label = (/^\d/.test(parts[0]) && parts[1] ? parts[0] + " " + parts[1] : hit.name || parts[0]) + (parts[2] ? ", " + parts.find((x, i) => i >= 2 && /^[A-Z][a-z]/.test(x) && !/County/.test(x)) : "");
+    pendingDrives(await drivesFrom(+hit.lat, +hit.lon), { lat: +hit.lat, lon: +hit.lon }, label.replace(/, undefined$/, ""));
   } catch (e) { toast("Couldn't look that up. Check your connection."); }
 }
 function locationHelp(kind) {
@@ -857,15 +915,15 @@ function locationHelp(kind) {
     typed: ""
   }[kind];
   openSheet(`
-    <h2>${kind === "typed" ? "Your home address" : "Couldn't get your location"}</h2>
+    <h2>${kind === "typed" ? "Type an address" : "Couldn't get your location"}</h2>
     ${msg}
     ${kind === "denied" || kind === "timeout" ? `<button class="chip on" data-act="retryLocation">Try again</button>` : ""}
-    ${kind === "typed" ? "" : "<h3>Or type your home address</h3>"}
+    ${kind === "typed" ? "" : "<h3>Or type an address</h3>"}
     <form class="search" id="addrForm">
       <input type="search" id="addr" placeholder="Street address, city" autocomplete="street-address" enterkeyhint="go">
       <button class="chip" type="submit">Use</button>
     </form>
-    <p class="note">Used once to work out the drive times. Only the minutes are saved, never the address. You can also set the minutes by hand in ⚙︎.</p>
+    <p class="note">Saved only on this phone, so you can pick it again later. You can also set the minutes by hand in ⚙︎.</p>
   `);
   $("addrForm").addEventListener("submit", ev => { ev.preventDefault(); drivesFromAddress($("addr").value); });
 }
@@ -879,7 +937,7 @@ function locationHelp(kind) {
   if (m === "out" || m === "ret") T.mode = m;
   const live = {};
   for (const h of Object.keys(HUBS)) { const n = parseInt(p.get("drive_" + h), 10); if (n > 0) live[h] = n; }
-  if (Object.keys(live).length) { T.start = "here"; T.here = Object.assign({}, S.drive, live); T.hereLabel = "Live (Shortcut)"; }
+  if (Object.keys(live).length) T.live = live;
   saveT();
   const keys = ["place", "arrive", "depart", "hub"];
   if (!keys.some(k => p.has(k))) return;
@@ -888,7 +946,7 @@ function locationHelp(kind) {
   const pl = (p.get("place") || "").match(/^(.+)\|(-?[\d.]+),(-?[\d.]+)$/);
   if (pl) {
     const id = "link-" + pl[1].toLowerCase().replace(/[^a-z0-9]+/g, "-");
-    S.places = S.places.filter(x => x.id !== id).concat([{ id, name: pl[1], short: pl[1], lat: +pl[2], lon: +pl[3] }]);
+    LIB.places = LIB.places.filter(x => x.id !== id).concat([{ id, name: pl[1], short: pl[1], lat: +pl[2], lon: +pl[3] }]); saveLib();
     S.dest = id;
   }
   if (/^\d{1,2}:\d{2}$/.test(p.get("arrive") || "")) S.arriveBy = p.get("arrive").padStart(5, "0");
@@ -898,6 +956,15 @@ function locationHelp(kind) {
 })();
 
 /* ================= actions ================= */
+// Drive times + where they came from -> saved starting point, used today or as the usual.
+const useToday = (drive, geo, name) => {
+  const st = saveStart(drive, geo, name);
+  T.startId = st.id; delete T.live; saveT(); render(); sheetFrom(); toast("Starting from " + st.name);
+};
+const useUsual = isHome => (drive, geo, name) => {
+  const st = saveStart(drive, geo, isHome ? "Home" + (name ? " · " + name : "") : name);
+  S.startId = st.id; delete T.startId; saveS(); saveT(); render(); sheetSettings(FIRST_RUN); toast("Drive times saved");
+};
 function clearPins() { delete T.bus_out; delete T.bus_ret; }
 let toastT;
 function toast(msg) { const el = $("toast"); el.textContent = msg; el.classList.add("show"); clearTimeout(toastT); toastT = setTimeout(() => el.classList.remove("show"), 2200); }
@@ -919,11 +986,13 @@ document.addEventListener("click", ev => {
     case "pick": {
       const x = lastResults[+v]; if (!x) return;
       const id = "p" + Date.now().toString(36);
-      S.places.push({ id, name: x.name, short: x.short, lat: x.lat, lon: x.lon }); saveS();
+      const near = LIB.places.find(p => dist(p, x) < 60);   // same place again? reuse it
+      if (near) { T.dest = near.id; clearPins(); saveT(); render(); sheetTo(); toast("Already saved"); return; }
+      LIB.places.push({ id, name: x.name, short: x.short, lat: x.lat, lon: x.lon }); saveLib();
       T.dest = id; clearPins(); saveT(); render(); sheetTo(); toast("Added " + x.short); return;
     }
     case "delPlace":
-      S.places = S.places.filter(p => p.id !== v); delete S.walkAdj[v];
+      LIB.places = LIB.places.filter(p => p.id !== v); saveLib(); delete S.walkAdj[v];
       if (S.dest === v) S.dest = DEFAULTS.dest;
       if (T.dest === v) delete T.dest;
       clearPins(); saveS(); saveT(); render(); sheetTo(); return;
@@ -931,20 +1000,31 @@ document.addEventListener("click", ev => {
     case "walk": { const id = P.place.id; S.walkAdj[id] = (S.walkAdj[id] || 0) + dd; legCache.clear(); saveS(); render(); sheetTo(); return; }
     case "nudge": { const k = b.dataset.k; T[k] = hmStr(hm(eff(k)) + dd); clearPins(); saveT(); render(); sheetTo(); return; }
     case "resetToday": b.dataset.k.split(",").forEach(k => delete T[k]); clearPins(); saveT(); render(); sheetTo(); return;
-    case "start":
-      if (v === "here") { measureDrives(here => { T.start = "here"; T.here = here; T.hereLabel = "Current location"; saveT(); render(); closeSheet(); toast("Drive times from here"); }); return; }
-      T.start = "home"; delete T.here; break;
+    case "start": T.startId = (v || null) === (S.startId || null) ? undefined : (v || null); delete T.live; break;
+    case "startHere": measureDrives(useToday); return;
+    case "startTyped": pendingDrives = useToday; locationHelp("typed"); return;
+    case "usualStart": S.startId = eff("startId"); delete T.startId; saveS(); saveT(); render(); sheetFrom(); toast("Saved as your usual"); return;
+    case "usualStartPick": S.startId = v || null; saveS(); render(); sheetSettings(true); return;
+    case "delStart":
+      LIB.starts = LIB.starts.filter(x => x.id !== v); saveLib();
+      if (S.startId === v) S.startId = null;
+      if (T.startId === v) delete T.startId;
+      saveS(); saveT(); render(); sheetFrom(); return;
     case "retryLocation": if (pendingDrives) measureDrives(pendingDrives); return;
-    case "typeAddress": pendingDrives = d => { S.drive = Object.assign({}, S.drive, d); saveS(); render(); sheetSettings(FIRST_RUN); toast("Drive times saved"); }; locationHelp("typed"); return;
-    case "measureHome": measureDrives(d => { S.drive = Object.assign({}, S.drive, d); saveS(); render(); sheetSettings(FIRST_RUN); toast("Drive times saved"); }); return;
+    case "typeAddress": pendingDrives = useUsual(false); locationHelp("typed"); return;
+    case "measureHome": measureDrives(useUsual(true)); return;
     case "traffic": T.traffic = +v || undefined; saveT(); render(); sheetFrom(); return;
-    case "sDrive": S.drive[b.dataset.h] = Math.max(0, S.drive[b.dataset.h] + dd); saveS(); render(); sheetSettings(); return;
+    case "sDrive": { const d = usualDrive(); d[b.dataset.h] = Math.max(0, d[b.dataset.h] + dd); saveS(); saveLib(); render(); sheetSettings(); return; }
     case "sPark": S.park[b.dataset.h] = Math.max(0, S.park[b.dataset.h] + dd); saveS(); render(); sheetSettings(); return;
     case "sBuffer": S.buffer = Math.max(0, S.buffer + dd); saveS(); render(); sheetSettings(); return;
     case "sCushion": S.cushion = Math.max(0, S.cushion + dd); saveS(); render(); sheetSettings(); return;
-    case "resetAll":
-      if (confirm("Reset all your settings on this phone?")) { store.set("startnow.settings", {}); S = loadSettings(); T = { date: todayKey() }; saveT(); render(); closeSheet(); }
-      return;
+    case "startOver":
+      if (!confirm("Start over? Times, stops and choices reset. Saved places and addresses stay so you can pick them again.")) return;
+      store.set("startnow.settings", {}); S = loadSettings(); T = { date: todayKey() }; saveS(); saveT(); legCache.clear(); render(); sheetSettings(true); return;
+    case "forgetAll":
+      if (!confirm("Forget everything on this phone, including saved places and addresses? This can't be undone.")) return;
+      ["startnow.settings", "startnow.today", "startnow.library"].forEach(k => { try { localStorage.removeItem(k); } catch (e) {} });
+      S = loadSettings(); LIB = { places: [], starts: [] }; T = { date: todayKey() }; saveS(); saveLib(); saveT(); legCache.clear(); render(); sheetSettings(true); return;
     default: return;
   }
   saveT(); render(); closeSheet();
