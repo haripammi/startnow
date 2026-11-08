@@ -138,6 +138,9 @@
   .steps i.done { background: var(--muted); }
   .steps i.cur { background: var(--go); width: 18px; border-radius: 4px; }
   .warn { color: var(--late); font-size: 12.5px; margin-top: 6px; }
+  .warn .link.inline { font-size: 12.5px; }
+  .late-note { color: var(--late); font-size: 13.5px; margin: 0 0 10px; }
+  .late-pill { display: inline-block; background: color-mix(in srgb, var(--late) 14%, transparent); color: var(--late); font-weight: 600; padding: 4px 10px; border-radius: 999px; }
 
   /* sheet */
   .shade { position: fixed; inset: 0; background: var(--shade); opacity: 0; pointer-events: none; transition: opacity .2s; z-index: 10; }
@@ -300,7 +303,7 @@ const DEFAULTS = {
   cushion: 1,      // arrive at least this early
   carWalk: 3       // stop -> car on the way back
 };
-const BUILD = "20261108150451";   // replaced with a timestamp by publish.sh
+const BUILD = "20261108151106";   // replaced with a timestamp by publish.sh
 const DEV = !/^\d+$/.test(BUILD);
 const SCHED = BUNDLED_SCHEDULE || { routes: {}, stops: {}, feed_info: {} };
 
@@ -470,6 +473,17 @@ function hubList(m) {
   return pref === "auto" ? Object.keys(HUBS) : [pref];
 }
 const h0 = t => t.hubId;
+const minOfDay = ts => { const d = new Date(ts); return d.getHours() * 60 + d.getMinutes() + d.getSeconds() / 60; };
+// A fresh location fix (last 15 min) tells us where you really are right now.
+const hereFresh = () => eff("startId") === "here" && LIB.here && LIB.here.at && Date.now() - LIB.here.at < 15 * 60000;
+// The moment we know you were still at your starting point. Trips you'd have had to leave for before
+// then can't be caught. null = we don't know (a saved starting point and no "Replan"), so keep the plan as is.
+function planFrom(m) {
+  let ref = null;
+  if (hereFresh() && (m === "out" || dist(LIB.here, placeById(eff("dest"))) < 500)) ref = minOfDay(LIB.here.at);
+  if (T.replanAt != null && T.replanMode === m) ref = Math.max(ref == null ? -1 : ref, T.replanAt);
+  return ref;
+}
 function options(m) {
   const place = placeById(eff("dest"));
   const cands = candidateStops(place, m);
@@ -506,10 +520,21 @@ function options(m) {
   const clean = list.filter(t => !list.some(o => o !== t && (m === "out"
     ? o.leave >= t.leave && o.arrive <= t.arrive && (o.leave > t.leave || o.arrive < t.arrive)
     : o.leave >= t.leave && o.home <= t.home && (o.leave > t.leave || o.home < t.home))));
-  let base = -1;
-  if (m === "out") { clean.forEach((t, i) => { if (t.ok) base = i; }); if (base < 0) base = 0; }
-  else { base = clean.findIndex(t => t.ok); if (base < 0) base = Math.max(0, clean.length - 1); }
-  return { place, trips: clean, base };
+  const ref = planFrom(m), can = t => ref == null || t.leave >= ref - 1;
+  let base = -1, status = "ok";
+  if (m === "out") {
+    clean.forEach((t, i) => { if (t.ok && can(t)) base = i; });          // latest on-time trip you can still make
+    if (base < 0) {                                                       // none on time: earliest arrival you can still make
+      const next = clean.map((_, i) => i).filter(i => can(clean[i]));
+      if (next.length) { base = next.reduce((a, b) => clean[b].arrive < clean[a].arrive ? b : a); status = "late"; }
+      else status = "none";
+    }
+  } else {
+    base = clean.findIndex(t => t.ok && can(t));
+    if (base < 0) base = clean.findIndex(t => can(t));
+    if (base < 0) status = "none";
+  }
+  return { place, trips: clean, base, status, ref, can };
 }
 
 function plan() {
@@ -519,10 +544,15 @@ function plan() {
   const pin = T["bus_" + m];
   if (pin && pin.dest === eff("dest")) {
     const i = opts.trips.findIndex(t => t.dep === pin.dep && t.route === pin.route && t.hubId === pin.hub);
-    if (i >= 0) idx = i;
+    if (i >= 0 && opts.can(opts.trips[i])) idx = i;                      // a picked trip you can no longer make is dropped
   }
-  const trip = opts.trips[idx] || null;
+  const trip = idx >= 0 ? opts.trips[idx] || null : null;
   const place = opts.place, name = place.short || place.name;
+  let status = opts.status;
+  if (trip && idx !== opts.base) status = m === "out" && !trip.ok ? "late" : "ok";
+  if (trip && m === "out" && !trip.ok) status = "late";
+  if (m === "out" && hereFresh() && dist(LIB.here, place) < 300) status = "arrived";
+  const lateBy = trip && m === "out" ? Math.round(trip.arrive - hm(eff("arriveBy"))) : 0;
   const hubId = trip ? trip.hubId : hubList(m)[0], hub = HUBS[hubId];
   if (m === "out" && trip && T.parked !== hubId) { T.parked = hubId; saveT(); } // remember where the car is
   let events = [];
@@ -540,7 +570,30 @@ function plan() {
       { t: trip.home, lbl: "Home in", what: `Drive ${driveMin(hubId)} min` }
     ];
   }
-  return { m, place, name, hubId, hub, opts, idx, trip, events, pinned: idx !== opts.base };
+  return { m, place, name, hubId, hub, opts, idx, trip, events, pinned: idx !== opts.base, status, lateBy };
+}
+
+/* ================= no transit left: drive instead ================= */
+const driveCache = {};
+function directDrive(from, to) {
+  if (!from || from.lat == null || !to) return null;
+  const k = [from.lat, from.lon, to.lat, to.lon].map(x => (+x).toFixed(3)).join(",");
+  if (k in driveCache) return driveCache[k];
+  driveCache[k] = null;
+  fetch(`https://router.project-osrm.org/route/v1/driving/${from.lon},${from.lat};${to.lon},${to.lat}?overview=false`)
+    .then(r => r.json()).then(j => { driveCache[k] = Math.ceil(j.routes[0].duration / 60 * 1.15); tick(); }).catch(() => {});
+  return null;
+}
+// Where you'd drive from / to if the bus is out: going = start -> destination; back = destination -> your car.
+function driveInsteadEnds() {
+  const st = eff("startId") === "here" ? LIB.here : LIB.starts.find(x => x.id === eff("startId"));
+  return P.m === "out" ? [st, P.place] : [P.place, P.hub];
+}
+function openDirections(to) {
+  const ios = /iPhone|iPad|iPod/.test(navigator.userAgent);
+  const url = ios ? `https://maps.apple.com/?daddr=${to.lat},${to.lon}&dirflg=d`
+                  : `https://www.google.com/maps/dir/?api=1&destination=${to.lat},${to.lon}&travelmode=driving`;
+  const a = document.createElement("a"); a.href = url; a.target = "_blank"; a.rel = "noopener"; a.click();
 }
 
 /* ================= rendering ================= */
@@ -589,7 +642,29 @@ function tick() {
   const d = new Date();
   $("now").textContent = d.toLocaleDateString([], { weekday: "short" }) + " " + fmt(d.getHours() * 60 + d.getMinutes());
   if (!P) return;
-  const ev = P.events, n = nowMin(), arc = $("arc");
+  const ev = P.events, n = nowMin(), arc = $("arc"), chip = $("what");
+  chip.dataset.act = "route"; delete chip.dataset.v;
+  $("recalc").classList.toggle("spin", hereState === "finding");
+  if (P.status === "arrived") {
+    $("lbl").textContent = `You're at ${P.name}`;
+    $("count").textContent = "✓";
+    $("at").textContent = "";
+    chip.textContent = "Plan the trip back"; chip.dataset.act = "mode"; chip.dataset.v = "ret";
+    $("warn").textContent = ""; $("steps").innerHTML = "";
+    arc.style.stroke = "var(--go)"; arc.style.strokeDashoffset = 0; return;
+  }
+  if (P.status === "none") {
+    const last = P.opts.trips[P.opts.trips.length - 1];
+    const [a, b] = driveInsteadEnds(), mins = directDrive(a, b);
+    $("lbl").textContent = P.m === "out" ? "Can't make it by transit" : "No more trips today";
+    $("count").textContent = "—";
+    $("at").textContent = last ? `Last one: leave by ${fmt(last.leave)}` : `Nothing on the ${dayType()} schedule`;
+    chip.textContent = `🚗 Drive instead${mins ? " · ~" + mins + " min" : ""}${P.m === "ret" ? " to " + P.hub.short : ""}`;
+    chip.dataset.act = "driveInstead";
+    $("warn").textContent = P.m === "out" && mins ? `Arrive about ${fmt(n + mins)}` : "";
+    $("steps").innerHTML = "";
+    arc.style.stroke = "var(--late)"; arc.style.strokeDashoffset = 0; return;
+  }
   if (!ev.length) {
     $("lbl").textContent = "No trips found";
     $("count").textContent = "--:--";
@@ -609,18 +684,23 @@ function tick() {
   }
   const e = ev[i], left = (e.t - n) * 60;
   const span = i === 0 ? 60 : Math.max(1, e.t - ev[i - 1].t);   // first step: the ring is the last hour
-  $("lbl").textContent = e.lbl;
-  $("count").textContent = countdown(left);
+  const mins = left / 60, late = P.status === "late";
+  $("lbl").textContent = (late && P.m === "out" && i === 0 ? "Running late · " : "") + (i === 0 && mins < 0.75 ? "Leave now" : e.lbl);
+  $("count").textContent = i === 0 && mins < 0.75 ? "Now" : countdown(left);
   $("at").textContent = "at " + fmt(e.t);
-  $("what").textContent = e.what;
-  $("recalc").classList.toggle("spin", hereState === "finding");
-  const mins = left / 60;
-  arc.style.stroke = i === 0 ? (mins > 10 ? "var(--go)" : mins > 3 ? "var(--soon)" : "var(--late)") : "var(--accent)";
+  chip.textContent = e.what;
+  arc.style.stroke = late ? "var(--late)" : i === 0 ? (mins > 10 ? "var(--go)" : mins > 3 ? "var(--soon)" : "var(--late)") : "var(--accent)";
   arc.style.strokeDashoffset = CIRC * (1 - Math.min(1, (e.t - n) / span));
-  let warn = "";
-  if (i === 1 && n - ev[0].t < 30) warn = `Planned to leave at ${fmt(ev[0].t)}`;
-  if (P.m === "out" && i === 0 && !P.trip.ok) warn = "Arrives after " + fmt(hm(eff("arriveBy")));
-  $("warn").textContent = warn;
+  const warn = $("warn");
+  if (late && P.m === "out") {
+    // Can't make the arrive-by time from where you are: say so, and this is already the next best plan.
+    warn.innerHTML = P.lateBy > 0
+      ? `<span class="late-pill">${P.lateBy} min late · arrive ${fmt(P.trip.arrive)}</span>`
+      : `<span class="late-pill">Cutting it close · arrive ${fmt(P.trip.arrive)}</span>`;
+  } else if (i === 1 && n - ev[0].t < 30 && P.opts.ref == null) {
+    // We don't know where you are: you may have left, or not.
+    warn.innerHTML = `Planned to leave ${fmt(ev[0].t)} · <button class="link inline" data-act="replan">Not left yet?</button>`;
+  } else warn.textContent = "";
   renderSteps(i);
 }
 function renderSteps(cur) {
@@ -722,7 +802,7 @@ function sheetRoute() {
   const m = mode();
   if (m === "ret") { sheetBus(); return; }
   const n = nowMin(), savedHub = T.hub;
-  const rows = Object.keys(HUBS).map(h => { T.hub = h; const o = options("out"); return o.trips.length ? { h, t: o.trips[o.base] } : null; }).filter(Boolean);
+  const rows = Object.keys(HUBS).map(h => { T.hub = h; const o = options("out"); return o.base >= 0 ? { h, t: o.trips[o.base] } : null; }).filter(Boolean);
   T.hub = savedHub;
   rows.sort((a, b) => (b.t.ok - a.t.ok) || (b.t.leave - a.t.leave));
   const cur = P.trip;
@@ -730,6 +810,8 @@ function sheetRoute() {
     <h2>Route options</h2>
     <div class="field" style="padding-top:0"><label>${esc(startName())} → ${esc(P.name)}<small>${hereNote() ? esc(hereNote()) + " · " : ""}arrive by ${fmt(hm(eff("arriveBy")))}</small></label>
       <button class="chip" data-act="recalc">↻ Recalculate</button></div>
+    ${P.status === "late" ? `<p class="late-note">You can't arrive by ${fmt(hm(eff("arriveBy")))} anymore. These are the fastest options from now.</p>` : ""}
+    ${P.status === "none" ? `<p class="late-note">No transit you can still catch today. <button class="link inline" data-act="driveInstead">Drive instead</button></p>` : ""}
     <button class="opt ${eff("hub") === "auto" ? "on" : ""}" data-act="hub" data-v="auto"><span><div class="t">Pick for me</div><div class="d">Always the option that lets me leave latest</div></span></button>
     ${rows.map(({ h, t }, i) => {
       const tag = i === 0 && t.ok ? `<span class="tag ok">Best</span>` : t.leave < n ? `<span class="tag gone">Gone</span>` : !t.ok ? `<span class="tag bad">Late</span>` : "";
@@ -1107,10 +1189,12 @@ document.addEventListener("click", ev => {
     case "from": sheetFrom(); return;
     case "hub": if (v === undefined) { mode() === "out" ? sheetRoute() : sheetHub(); return; } T.hub = v === S.hub ? undefined : v; clearPins(); break;
     case "route": sheetRoute(); return;
+    case "replan": T.replanAt = nowMin(); T.replanMode = mode(); clearPins(); saveT(); render(); toast("Planning from now"); return;
+    case "driveInstead": { const [, to] = driveInsteadEnds(); if (to) openDirections(to); return; }
     case "busList": sheetBus(); return;
     case "pickRoute": T.hub = b.dataset.h; T.bus_out = { dep: +v, route: b.dataset.r, hub: b.dataset.h, dest: eff("dest") }; break;
     case "recalc": {
-      $("recalc").classList.add("spin"); legCache.clear(); clearPins(); saveT();
+      $("recalc").classList.add("spin"); legCache.clear(); clearPins(); T.replanAt = nowMin(); T.replanMode = mode(); saveT();
       refreshHere(true).then(() => { render(); checkForUpdate(); toast("Recalculated " + fmt(nowMin())); if ($("sheet").classList.contains("open") && $("sheetBody").querySelector("[data-act=pickRoute]")) sheetRoute(); });
       return;
     }
@@ -1137,7 +1221,7 @@ document.addEventListener("click", ev => {
     case "resetToday": b.dataset.k.split(",").forEach(k => delete T[k]); clearPins(); saveT(); render(); sheetTo(); return;
     case "start":
       // New starting point: forget today's park & ride / bus picks so the best route is chosen again.
-      T.startId = (v || null) === (S.startId || null) ? undefined : (v || null); delete T.live; delete T.hub; clearPins();
+      T.startId = (v || null) === (S.startId || null) ? undefined : (v || null); delete T.live; delete T.hub; delete T.replanAt; clearPins();
       saveT(); render(); closeSheet(); if (eff("startId") === "here") refreshHere(); return;
     case "startHere": measureDrives(useToday); return;
     case "startTyped": pendingDrives = useToday; locationHelp("typed"); return;
