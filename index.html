@@ -287,7 +287,7 @@ const DEFAULTS = {
   cushion: 1,      // arrive at least this early
   carWalk: 3       // stop -> car on the way back
 };
-const BUILD = "20261108144019";   // replaced with a timestamp by publish.sh
+const BUILD = "20261108145145";   // replaced with a timestamp by publish.sh
 const DEV = !/^\d+$/.test(BUILD);
 const SCHED = BUNDLED_SCHEDULE || { routes: {}, stops: {}, feed_info: {} };
 
@@ -722,7 +722,7 @@ function sheetSettings(welcome) {
     <h3>Cushions</h3>
     <div class="field"><label>Be at the stop early</label>${stepper("sBuffer", S.buffer, " min")}</div>
     <div class="field"><label>Arrive early by at least</label>${stepper("sCushion", S.cushion, " min")}</div>
-    <p class="note">Version ${DEV ? "dev" : BUILD.replace(/^(\d{4})(\d\d)(\d\d)(\d\d)(\d\d).*/, "$1-$2-$3 $4:$5")} · <button class="link inline" data-act="checkUpdate">Check for update</button><br>
+    <p class="note">Version ${DEV ? "dev" : BUILD.replace(/^(\d{4})(\d\d)(\d\d)(\d\d)(\d\d).*/, "$1-$2-$3 $4:$5")} · <button class="link inline" data-act="checkUpdate">Check for update</button> · <button class="link inline" data-act="hardReload">Reload app</button><br>
       Routes: ${Object.keys(SCHED.routes || {}).map(routeLabel).join(", ")}. Timetable valid until ${end}.${expired ? ' <b style="color:var(--late)">Expired: reload when online for an update.</b>' : ""}</p>
     ${welcome ? `<button class="chip on" data-act="close" style="margin-top:14px">Done</button>` : `
     <h3>Start over</h3>
@@ -994,6 +994,14 @@ async function checkForUpdate(manual) {
   } catch (e) { if (manual) toast("Offline: can't check right now"); }
 }
 
+// Throw away every cached copy of the app (not your settings or saved places) and load it fresh.
+async function hardReload() {
+  toast("Reloading…");
+  try { for (const r of (await navigator.serviceWorker?.getRegistrations?.()) || []) await r.unregister(); } catch (e) {}
+  try { for (const k of await caches.keys()) await caches.delete(k); } catch (e) {}
+  location.replace(location.pathname + "?fresh=" + Date.now());
+}
+
 /* ================= actions ================= */
 // Drive times + where they came from -> saved starting point, used today or as the usual.
 const useToday = (drive, geo, name) => {
@@ -1015,6 +1023,7 @@ document.addEventListener("click", ev => {
     case "close": closeSheet(); saveS(); return;
     case "map": sheetMap(); return;
     case "checkUpdate": checkForUpdate(true); return;
+    case "hardReload": hardReload(); return;
     case "mode": T.mode = v; saveT(); render(); return;
     case "settings": sheetSettings(); return;
     case "to": sheetTo(); return;
@@ -1089,6 +1098,7 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden) { T 
 window.addEventListener("pageshow", e => { if (e.persisted) checkForUpdate(); });
 if ("serviceWorker" in navigator && location.protocol === "https:") navigator.serviceWorker.register("sw.js").catch(() => {});
 checkForUpdate();
+if (/[?&]fresh=/.test(location.search)) { history.replaceState(null, "", location.pathname); setTimeout(() => toast("Reloaded the latest version"), 400); }
 try { const u = sessionStorage.getItem("startnow.updated"); if (u) { sessionStorage.removeItem("startnow.updated"); setTimeout(() => toast("Updated to the latest version"), 400); } } catch (e) {}
 </script>
 </body>
