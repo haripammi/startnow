@@ -1,5 +1,5 @@
-// Offline support: always try the network first (so timetable updates arrive), fall back to the saved copy.
-const CACHE = "startnow-202611081435";
+// Offline support: always ask the network first (so updates arrive), fall back to the saved copy when offline.
+const CACHE = "startnow-20261108144019";
 const FILES = ["./", "index.html", "manifest.webmanifest", "icon-180.png", "icon-512.png"];
 self.addEventListener("install", e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES))); self.skipWaiting(); });
 self.addEventListener("activate", e => {
@@ -9,11 +9,12 @@ self.addEventListener("activate", e => {
 self.addEventListener("fetch", e => {
   const url = new URL(e.request.url);
   if (e.request.method !== "GET" || url.origin !== location.origin) return; // maps/search/routing go straight to the network
+  if (url.pathname.endsWith("/version.json")) return;                      // update checks always hit the server
+  const key = e.request.mode === "navigate" ? "./" : url.pathname;
   e.respondWith(
-    fetch(e.request).then(r => {
-      const copy = r.clone();
-      caches.open(CACHE).then(c => c.put(url.pathname.endsWith("/") ? "./" : e.request, copy));
+    fetch(e.request, { cache: "no-cache" }).then(r => {
+      if (r.ok) { const copy = r.clone(); caches.open(CACHE).then(c => c.put(key, copy)); }
       return r;
-    }).catch(() => caches.match(e.request, { ignoreSearch: true }).then(r => r || caches.match("./")))
+    }).catch(() => caches.match(key).then(r => r || caches.match("./")))
   );
 });

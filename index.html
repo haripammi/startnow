@@ -41,6 +41,8 @@
       --shade: rgba(15,23,42,.35);
     }
   }
+  /* Space for the notch / Dynamic Island / home bar. --safe-fallback is set by script if the phone reports 0. */
+  :root { --safe-top: max(env(safe-area-inset-top, 0px), var(--safe-fallback, 0px)); --safe-bottom: env(safe-area-inset-bottom, 0px); }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body { margin: 0; height: 100%; }
   body {
@@ -58,7 +60,7 @@
     display: grid;
     grid-template-rows: auto auto 1fr auto;
     gap: 12px;
-    padding: calc(env(safe-area-inset-top) + 10px) 16px calc(env(safe-area-inset-bottom) + 14px);
+    padding: calc(var(--safe-top) + clamp(10px, 2.2dvh, 20px)) max(16px, env(safe-area-inset-right)) calc(var(--safe-bottom) + 12px) max(16px, env(safe-area-inset-left));
   }
 
   /* top strip */
@@ -137,9 +139,9 @@
     position: fixed; left: 0; right: 0; bottom: 0; z-index: 11;
     max-width: 520px; margin: 0 auto;
     background: var(--sheet); border-radius: 22px 22px 0 0;
-    padding: 10px 18px calc(env(safe-area-inset-bottom) + 18px);
+    padding: 10px 18px calc(var(--safe-bottom) + 18px);
     transform: translateY(105%); transition: transform .25s ease;
-    max-height: 82dvh; overflow-y: auto;
+    max-height: calc(100dvh - var(--safe-top) - 24px); overflow-y: auto;
     border-top: 1px solid var(--line);
   }
   .sheet.open { transform: none; }
@@ -186,15 +188,21 @@
   .link { border: 0; background: none; color: var(--accent); padding: 12px 0 0; cursor: pointer; font-size: 14px; }
   .note { font-size: 12.5px; color: var(--muted); margin-top: 14px; line-height: 1.45; }
   .toast {
-    position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom) + 24px); transform: translateX(-50%);
+    position: fixed; left: 50%; bottom: calc(var(--safe-bottom) + 24px); transform: translateX(-50%);
     background: var(--text); color: var(--bg); padding: 9px 16px; border-radius: 999px; font-size: 13.5px;
     opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 20; white-space: nowrap;
   }
   .toast.show { opacity: 1; }
 
-  @media (max-height: 640px) {
-    .corner { min-height: 66px; padding: 9px 11px; }
+  @media (max-height: 700px) {
+    .corner { min-height: 64px; padding: 8px 11px; }
+    .corner .v { font-size: 15px; }
     .app { gap: 8px; }
+  }
+  @media (max-width: 350px) {
+    .seg button { padding: 6px 10px; }
+    .corner .v { font-size: 14.5px; }
+    .corner .s { font-size: 11.5px; }
   }
 </style>
 </head>
@@ -279,6 +287,8 @@ const DEFAULTS = {
   cushion: 1,      // arrive at least this early
   carWalk: 3       // stop -> car on the way back
 };
+const BUILD = "20261108144019";   // replaced with a timestamp by publish.sh
+const DEV = !/^\d+$/.test(BUILD);
 const SCHED = BUNDLED_SCHEDULE || { routes: {}, stops: {}, feed_info: {} };
 
 /* ================= storage (per device) ================= */
@@ -712,7 +722,8 @@ function sheetSettings(welcome) {
     <h3>Cushions</h3>
     <div class="field"><label>Be at the stop early</label>${stepper("sBuffer", S.buffer, " min")}</div>
     <div class="field"><label>Arrive early by at least</label>${stepper("sCushion", S.cushion, " min")}</div>
-    <p class="note">Routes: ${Object.keys(SCHED.routes || {}).map(routeLabel).join(", ")}. Timetable valid until ${end}.${expired ? ' <b style="color:var(--late)">Expired: reload when online for an update.</b>' : ""}</p>
+    <p class="note">Version ${DEV ? "dev" : BUILD.replace(/^(\d{4})(\d\d)(\d\d)(\d\d)(\d\d).*/, "$1-$2-$3 $4:$5")} · <button class="link inline" data-act="checkUpdate">Check for update</button><br>
+      Routes: ${Object.keys(SCHED.routes || {}).map(routeLabel).join(", ")}. Timetable valid until ${end}.${expired ? ' <b style="color:var(--late)">Expired: reload when online for an update.</b>' : ""}</p>
     ${welcome ? `<button class="chip on" data-act="close" style="margin-top:14px">Done</button>` : `
     <h3>Start over</h3>
     <button class="opt" data-act="startOver"><span><div class="t">Start over</div><div class="d">Resets times, stops and choices. Your ${LIB.places.length + LIB.starts.length} saved places and addresses stay, ready to pick again.</div></span></button>
@@ -859,12 +870,18 @@ function measureDrives(onDone) {
   pendingDrives = onDone;
   if (!navigator.geolocation || !window.isSecureContext) { locationHelp("unavailable"); return; }
   toast("Finding you…");
-  navigator.geolocation.getCurrentPosition(async pos => {
+  const ok = async pos => {
     const geo = { lat: pos.coords.latitude, lon: pos.coords.longitude };
     try { onDone(await drivesFrom(geo.lat, geo.lon), geo, await nearbyLabel(geo)); }
-    catch (e) { toast("Couldn't get drive times. Check your connection."); }
-  }, err => locationHelp(err.code === 1 ? "denied" : err.code === 3 ? "timeout" : "unavailable"),
-  { enableHighAccuracy: false, timeout: 20000, maximumAge: 10 * 60 * 1000 });
+    catch (e) { toast("Got your location, but couldn't get drive times. Check your connection."); }
+  };
+  const fail = err => locationHelp(err.code === 1 ? "denied" : err.code === 3 ? "timeout" : "unavailable",
+    `code ${err.code}${err.message ? ": " + err.message : ""}`);
+  // Quick, low-power try first; if the phone can't place you, try once more with GPS.
+  navigator.geolocation.getCurrentPosition(ok, err => {
+    if (err.code === 1) return fail(err);
+    navigator.geolocation.getCurrentPosition(ok, fail, { enableHighAccuracy: true, timeout: 30000, maximumAge: 0 });
+  }, { enableHighAccuracy: false, timeout: 15000, maximumAge: 10 * 60 * 1000 });
 }
 // Short street name for a location, e.g. "NE 85th St, Redmond" (asks OpenStreetMap once).
 async function nearbyLabel(geo) {
@@ -901,23 +918,25 @@ async function drivesFromAddress(q) {
     pendingDrives(await drivesFrom(+hit.lat, +hit.lon), { lat: +hit.lat, lon: +hit.lon }, label.replace(/, undefined$/, ""));
   } catch (e) { toast("Couldn't look that up. Check your connection."); }
 }
-function locationHelp(kind) {
+function locationHelp(kind, detail) {
   const msg = {
     denied: `<p class="note" style="margin-top:0">Your iPhone is blocking location for websites. To turn it on:</p>
       <ol class="steps-help">
         <li><b>Settings → Privacy &amp; Security → Location Services</b>: on.</li>
         <li>On the same screen, scroll to <b>Safari Websites</b> and pick <b>While Using the App</b>.</li>
         <li>If you tapped “Don’t Allow” before: <b>Settings → Apps → Safari → Location</b> → <b>Ask</b>.</li>
-        <li>Come back here and tap <b>Try again</b>, then <b>Allow</b>.</li>
+        <li>Close this app fully (swipe it away), open it again, tap <b>Try again</b>, then <b>Allow</b>.</li>
+        <li>Still blocked? A Home Screen app remembers “Don’t Allow” on its own. Remove the Start Now icon, open the link in Safari, and Add to Home Screen again. Your saved data on the old icon will not carry over.</li>
       </ol>`,
     timeout: `<p class="note" style="margin-top:0">Finding your location took too long. Try again, ideally on Wi-Fi or near a window.</p>`,
-    unavailable: `<p class="note" style="margin-top:0">Location isn't available right now.</p>`,
+    unavailable: `<p class="note" style="margin-top:0">Your phone couldn't work out where you are. Check that Location Services is on, then try again (Wi-Fi on helps, even if not connected).</p>`,
     typed: ""
   }[kind];
   openSheet(`
     <h2>${kind === "typed" ? "Type an address" : "Couldn't get your location"}</h2>
     ${msg}
-    ${kind === "denied" || kind === "timeout" ? `<button class="chip on" data-act="retryLocation">Try again</button>` : ""}
+    ${kind === "denied" || kind === "timeout" || kind === "unavailable" ? `<button class="chip on" data-act="retryLocation">Try again</button>` : ""}
+    ${detail ? `<p class="note">Details: ${esc(detail)}</p>` : ""}
     ${kind === "typed" ? "" : "<h3>Or type an address</h3>"}
     <form class="search" id="addrForm">
       <input type="search" id="addr" placeholder="Street address, city" autocomplete="street-address" enterkeyhint="go">
@@ -955,6 +974,26 @@ function locationHelp(kind) {
   S.links.push(sig); saveS();
 })();
 
+/* ================= updates =================
+   Every open (and every return to the app) asks the server which version is live; if it's newer, reload. */
+async function checkForUpdate(manual) {
+  if (DEV || location.protocol !== "https:") { if (manual) toast("Up to date (dev copy)"); return; }
+  try {
+    const j = await (await fetch("version.json?t=" + Date.now(), { cache: "no-store" })).json();
+    if (j.build && j.build !== BUILD) {
+      let tries = 0; try { tries = +sessionStorage.getItem("startnow.reloads") || 0; } catch (e) {}
+      if (tries >= 2) return;                       // never loop if a cache is being stubborn
+      try { sessionStorage.setItem("startnow.reloads", tries + 1); sessionStorage.setItem("startnow.updated", "1"); } catch (e) {}
+      const reg = navigator.serviceWorker && await navigator.serviceWorker.getRegistration();
+      if (reg) await reg.update().catch(() => {});
+      location.reload();
+    } else {
+      try { sessionStorage.removeItem("startnow.reloads"); } catch (e) {}
+      if (manual) toast("You have the latest version");
+    }
+  } catch (e) { if (manual) toast("Offline: can't check right now"); }
+}
+
 /* ================= actions ================= */
 // Drive times + where they came from -> saved starting point, used today or as the usual.
 const useToday = (drive, geo, name) => {
@@ -975,6 +1014,7 @@ document.addEventListener("click", ev => {
   switch (a) {
     case "close": closeSheet(); saveS(); return;
     case "map": sheetMap(); return;
+    case "checkUpdate": checkForUpdate(true); return;
     case "mode": T.mode = v; saveT(); render(); return;
     case "settings": sheetSettings(); return;
     case "to": sheetTo(); return;
@@ -1031,12 +1071,25 @@ document.addEventListener("click", ev => {
 });
 
 /* ================= go ================= */
+(function safeAreaFallback() {
+  const standalone = navigator.standalone || matchMedia("(display-mode: standalone)").matches;
+  if (!standalone) return;
+  const probe = document.createElement("div");
+  probe.style.cssText = "position:fixed;top:0;left:0;width:1px;height:env(safe-area-inset-top,0px);visibility:hidden";
+  document.body.appendChild(probe);
+  const h = probe.getBoundingClientRect().height; probe.remove();
+  // Phone says there's no notch but we're drawing under the status bar: leave room anyway.
+  if (h < 1 && /iPhone|iPad|iPod/.test(navigator.userAgent)) document.documentElement.style.setProperty("--safe-fallback", (Math.max(screen.width, screen.height) >= 812 ? 54 : 22) + "px");
+})();
 render();
 if (FIRST_RUN) sheetSettings(true);
 setInterval(tick, 1000);
 setInterval(() => { if (T.date !== todayKey()) { T = loadToday(); legCache.clear(); } render(); }, 30000);
-document.addEventListener("visibilitychange", () => { if (!document.hidden) { T = loadToday(); legCache.clear(); render(); } });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { T = loadToday(); legCache.clear(); render(); checkForUpdate(); } });
+window.addEventListener("pageshow", e => { if (e.persisted) checkForUpdate(); });
 if ("serviceWorker" in navigator && location.protocol === "https:") navigator.serviceWorker.register("sw.js").catch(() => {});
+checkForUpdate();
+try { const u = sessionStorage.getItem("startnow.updated"); if (u) { sessionStorage.removeItem("startnow.updated"); setTimeout(() => toast("Updated to the latest version"), 400); } } catch (e) {}
 </script>
 </body>
 </html>
