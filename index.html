@@ -312,9 +312,10 @@ const DEFAULTS = {
   links: [],       // setup links already applied
   buffer: 2,       // be at the stop this early
   cushion: 1,      // arrive at least this early
-  carWalk: 3       // stop -> car on the way back
+  carWalk: 3,      // stop -> car on the way back
+  driveSave: 15    // Pick for me: drive to a farther stop only if it lets you leave at least this much later
 };
-const BUILD = "20261109083615";   // replaced with a timestamp by publish.sh
+const BUILD = "20261109134153";   // replaced with a timestamp by publish.sh
 const DEV = !/^\d+$/.test(BUILD);
 const SCHED = BUNDLED_SCHEDULE || { routes: {}, stops: {}, feed_info: {} };
 
@@ -508,6 +509,15 @@ function canCatch(t, m, n) {
   return n + toStop <= t.dep;
 }
 // keep: a trip you picked; it stays in the list even if another stop's trip beats it.
+// Pick for me (going): the least driving, unless a farther stop lets you leave more than S.driveSave min later.
+function leastDriving(list) {
+  if (!list.length) return null;
+  const latest = Math.max(...list.map(t => t.leave));
+  return list.filter(t => t.leave > latest - S.driveSave - 0.01).reduce((a, b) => {
+    const da = driveMin(a.hubId), db = driveMin(b.hubId);
+    return db < da || (db === da && b.leave > a.leave) ? b : a;
+  });
+}
 function options(m, keep) {
   const place = placeById(eff("dest"));
   const cands = candidateStops(place, m);
@@ -542,13 +552,14 @@ function options(m, keep) {
   const list = [...seen.values()].sort((a, b) => a.leave - b.leave || (m === "out" ? a.arrive - b.arrive : a.home - b.home));
   // drop rows that are strictly worse (leave earlier AND arrive later than another)
   const kept = t => keep && t.dep === keep.dep && t.route === keep.route && t.hubId === keep.hub;
-  const clean = list.filter(t => kept(t) || !list.some(o => o !== t && (m === "out"
+  // (compared within the same stop only, so a closer stop isn't dropped before Pick for me can weigh it)
+  const clean = list.filter(t => kept(t) || !list.some(o => o !== t && o.hubId === t.hubId && (m === "out"
     ? o.leave >= t.leave && o.arrive <= t.arrive && (o.leave > t.leave || o.arrive < t.arrive)
     : o.leave >= t.leave && o.home <= t.home && (o.leave > t.leave || o.home < t.home))));
   const n = nowMin(), can = t => canCatch(t, m, n);
   let base = -1;
   if (m === "out") {
-    clean.forEach((t, i) => { if (t.ok) base = i; });                    // the plan: latest trip that's on time
+    base = clean.indexOf(leastDriving(clean.filter(t => t.ok)));         // the plan: on time, least driving
     if (base < 0 && clean.length) {                                       // nothing on time: earliest arrival you can still catch
       const c = clean.map((_, i) => i).filter(i => can(clean[i]));
       base = c.length ? c.reduce((a, b) => clean[b].arrive < clean[a].arrive ? b : a) : clean.length - 1;
@@ -560,7 +571,7 @@ function options(m, keep) {
   // The suggestion if the plan can't be caught any more (never applied unless you tap it).
   const catchable = clean.filter(can);
   const next = m === "out"
-    ? (catchable.filter(t => t.ok).pop() || catchable.reduce((a, b) => (!a || b.arrive < a.arrive) ? b : a, null))
+    ? (leastDriving(catchable.filter(t => t.ok)) || catchable.reduce((a, b) => (!a || b.arrive < a.arrive) ? b : a, null))
     : (catchable.find(t => t.ok) || catchable[0] || null);
   return { place, trips: clean, base, next, can };
 }
@@ -886,7 +897,8 @@ function sheetRoute() {
     return pick ? { h, t: pick } : null;
   }).filter(Boolean);
   T.hub = savedHub;
-  rows.sort((a, b) => (b.t.ok - a.t.ok) || (b.t.leave - a.t.leave));
+  const best = leastDriving(rows.map(r => r.t).filter(t => t.ok));
+  rows.sort((a, b) => ((b.t === best) - (a.t === best)) || (b.t.ok - a.t.ok) || (b.t.leave - a.t.leave));
   const cur = P.trip;
   openSheet(`
     <h2>Route options</h2>
@@ -895,10 +907,10 @@ function sheetRoute() {
     ${P.status === "missed" ? `<p class="late-note">Your planned ${routeLabel(P.trip.route)} ${fmt(P.trip.dep)} can't be caught any more. Pick another option below.</p>` : ""}
     ${P.status === "behind" ? `<p class="late-note">You're past the planned leave time, but can still make it if you go now. Or pick another option.</p>` : ""}
     ${P.status === "none" ? `<p class="late-note">No transit you can still catch today. <button class="link inline" data-act="driveInstead">Drive instead</button></p>` : ""}
-    <button class="opt ${eff("hub") === "auto" ? "on" : ""}" data-act="hub" data-v="auto"><span><div class="t">Pick for me</div><div class="d">Always the option that lets me leave latest</div></span></button>
+    <button class="opt ${eff("hub") === "auto" && !P.pinned ? "on" : ""}" data-act="hub" data-v="auto"><span><div class="t">Pick for me</div><div class="d">Least driving, unless a farther stop lets me leave ${S.driveSave}+ min later</div></span></button>
     ${rows.map(({ h, t }, i) => {
-      const tag = !t.ok ? `<span class="tag bad">Late</span>` : t.leave < n ? `<span class="tag bad">Go now</span>` : i === 0 ? `<span class="tag ok">Best</span>` : "";
-      const on = cur && cur.hubId === h && eff("hub") !== "auto";
+      const tag = !t.ok ? `<span class="tag bad">Late</span>` : t.leave < n ? `<span class="tag bad">Go now</span>` : t === best ? `<span class="tag ok">Best</span>` : "";
+      const on = cur && cur.hubId === h && (P.pinned || eff("hub") !== "auto");
       return `<button class="opt ${on ? "on" : ""}" data-act="pickRoute" data-h="${h}" data-v="${t.dep}" data-r="${esc(t.route)}">
         <span><div class="t">Leave ${fmt(t.leave)} · ${HUBS[h].short}</div>
         <div class="d">🚗 ${driveMin(h)} min · ${esc(routeLabel(t.route))} ${fmt(t.dep)} from ${esc(bayOf(t.from))} · arrive ${fmt(t.arrive)}</div></span>${tag}</button>`;
@@ -921,15 +933,16 @@ function sheetHub() {
   T.hub = savedT;
   openSheet(`<h2>${m === "out" ? "Where to park & board" : "Where is your car?"}</h2>
     <button class="opt ${cur === "auto" ? "on" : ""}" data-act="hub" data-v="auto"><span><div class="t">${m === "out" ? "Pick for me" : "Where I parked this morning"}</div>
-      <div class="d">${m === "out" ? "Whichever lets me leave latest" : (T.parked ? HUBS[T.parked].name : "Best option")}</div></span></button>
+      <div class="d">${m === "out" ? `Least driving, unless a farther stop lets me leave ${S.driveSave}+ min later` : (T.parked ? HUBS[T.parked].name : "Best option")}</div></span></button>
     ${rows}<p class="note">For today only. Your usual is in ⚙︎.</p>`);
 }
 
 function sheetBus() {
   const { opts, idx, m } = P, n = nowMin();
-  const from = Math.max(0, opts.base - 3), to = Math.min(opts.trips.length, opts.base + 6);
-  const rows = opts.trips.slice(from, to).map((t, k) => {
-    const i = from + k;
+  // this stop's trips only, a few either side of the plan
+  const mine = opts.trips.map((t, i) => [t, i]).filter(([t]) => t.hubId === P.hubId);
+  const at = Math.max(0, mine.findIndex(([, i]) => i === idx));
+  const rows = mine.slice(Math.max(0, at - 3), at + 6).map(([t, i]) => {
     const tag = !opts.can(t) ? `<span class="tag gone">Gone</span>` : i === opts.base ? `<span class="tag ok">Best</span>` : t.leave < n ? `<span class="tag bad">Go now</span>`
       : !t.ok ? `<span class="tag bad">${m === "out" ? "Late" : "Before " + fmt(hm(eff("leaveAt")))}</span>` : "";
     const d = m === "out" ? `${HUBS[t.hubId].short} · leave ${fmt(t.leave)} · arrive ${fmt(t.arrive)}`
@@ -963,6 +976,7 @@ function sheetSettings(welcome) {
     <h3>Cushions</h3>
     <div class="field"><label>Be at the stop early</label>${stepper("sBuffer", S.buffer, " min")}</div>
     <div class="field"><label>Arrive early by at least</label>${stepper("sCushion", S.cushion, " min")}</div>
+    <div class="field"><label>Drive farther only if I can leave later by<small>For “Pick for me”: otherwise the closest stop wins</small></label>${stepper("sDriveSave", S.driveSave, " min")}</div>
     <p class="note">Version ${DEV ? "dev" : BUILD.replace(/^(\d{4})(\d\d)(\d\d)(\d\d)(\d\d).*/, "$1-$2-$3 $4:$5")} · <button class="link inline" data-act="checkUpdate">Check for update</button> · <button class="link inline" data-act="hardReload">Reload app</button>${IS_IOS || DEV ? ` · <button class="link inline" data-act="islandSetup">Dynamic Island timer</button>` : ""}<br>
       Routes: ${Object.keys(SCHED.routes || {}).map(routeLabel).join(", ")}. Timetable valid until ${end}.${expired ? ' <b style="color:var(--late)">Expired: reload when online for an update.</b>' : ""}</p>
     ${welcome ? `<button class="chip on" data-act="close" style="margin-top:14px">Done</button>` : `
@@ -1331,6 +1345,7 @@ document.addEventListener("click", ev => {
     case "sPark": S.park[b.dataset.h] = Math.max(0, S.park[b.dataset.h] + dd); saveS(); render(); sheetSettings(); return;
     case "sBuffer": S.buffer = Math.max(0, S.buffer + dd); saveS(); render(); sheetSettings(); return;
     case "sCushion": S.cushion = Math.max(0, S.cushion + dd); saveS(); render(); sheetSettings(); return;
+    case "sDriveSave": S.driveSave = Math.max(0, Math.min(60, S.driveSave + 5 * dd)); saveS(); render(); sheetSettings(); return;
     case "startOver":
       if (!confirm("Start over? Times, stops and choices reset. Saved places and addresses stay so you can pick them again.")) return;
       store.set("startnow.settings", {}); S = loadSettings(); T = { date: todayKey() }; saveS(); saveT(); legCache.clear(); render(); sheetSettings(true); return;
