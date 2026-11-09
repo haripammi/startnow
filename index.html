@@ -125,6 +125,10 @@
   .lbl { font-size: clamp(13px, 3.8vw, 16px); color: var(--muted); font-weight: 500; }
   .count { font-size: clamp(44px, 15vw, 80px); font-weight: 600; letter-spacing: -.02em; font-variant-numeric: tabular-nums; line-height: 1.05; margin: 4px 0 2px; }
   .at { font-size: clamp(13px, 3.8vw, 16px); color: var(--text); }
+  /* the clock time of the countdown, nearly as easy to read as the countdown itself */
+  .at.time { display: flex; align-items: baseline; gap: 6px; margin-top: 2px; }
+  .at.time .k { font-size: clamp(13px, 3.8vw, 16px); color: var(--muted); }
+  .at.time .t { font-size: clamp(22px, 7vw, 34px); font-weight: 600; letter-spacing: -.01em; font-variant-numeric: tabular-nums; }
   .route-row { display: flex; align-items: center; gap: 6px; margin-top: 10px; max-width: 100%; }
   .route-chip { border: 1px solid var(--line); background: var(--card); border-radius: 999px; padding: 6px 12px; font-size: 12.5px;
     color: var(--text); cursor: pointer; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
@@ -310,7 +314,7 @@ const DEFAULTS = {
   cushion: 1,      // arrive at least this early
   carWalk: 3       // stop -> car on the way back
 };
-const BUILD = "20261109080950";   // replaced with a timestamp by publish.sh
+const BUILD = "20261109083615";   // replaced with a timestamp by publish.sh
 const DEV = !/^\d+$/.test(BUILD);
 const SCHED = BUNDLED_SCHEDULE || { routes: {}, stops: {}, feed_info: {} };
 
@@ -693,6 +697,7 @@ function sheetIsland() {
     <p class="note">The timer shows in the Dynamic Island and on the Lock Screen, and rings when it's time. It doesn't follow plan changes: tap ⏱ again after changing your plan (and cancel the old timer). After it starts, swipe back to Start Now.</p>
   `);
 }
+function atTime(k, t) { const el = $("at"); el.className = "at time"; el.innerHTML = `<span class="k">${k}</span><span class="t">${fmt(t)}</span>`; }
 function tick() {
   const d = new Date();
   $("now").textContent = d.toLocaleDateString([], { weekday: "short" }) + " " + fmt(d.getHours() * 60 + d.getMinutes());
@@ -700,7 +705,7 @@ function tick() {
   const ev = P.events, n = nowMin(), arc = $("arc"), chip = $("what");
   chip.dataset.act = "route"; delete chip.dataset.v;
   $("recalc").classList.toggle("spin", hereState === "finding");
-  setIsland(null);
+  setIsland(null); $("at").className = "at";
   if (P.status === "arrived") {
     $("lbl").textContent = `You're at ${P.name}`;
     $("count").textContent = "✓";
@@ -746,7 +751,7 @@ function tick() {
   if (i < 0) {
     $("lbl").textContent = P.m === "out" ? "You should be there" : "You should be home";
     $("count").textContent = "✓";
-    $("at").textContent = fmt(ev[ev.length - 1].t);
+    atTime("at", ev[ev.length - 1].t);
     $("what").textContent = P.m === "out" ? "Trip home" : "";
     $("warn").textContent = "";
     arc.style.stroke = "var(--muted)"; arc.style.strokeDashoffset = 0;
@@ -758,7 +763,7 @@ function tick() {
   $("lbl").textContent = behind && i === 1 ? `Leave now · ${routeLabel(P.trip.route)} leaves in` : i === 0 && mins < 0.75 ? "Leave now" : e.lbl;
   $("count").textContent = i === 0 && mins < 0.75 ? "Now" : countdown(left);
   if (left > 30) setIsland({ sec: left, lbl: behind && i === 1 ? routeLabel(P.trip.route) + " leaves" : e.lbl.replace(/ in$/, "") });
-  $("at").textContent = "at " + fmt(e.t);
+  atTime("at", e.t);
   chip.textContent = behind && i === 1 ? ev[0].what : e.what;   // behind: the drive is still the next thing to do
   arc.style.stroke = late ? "var(--late)" : behind ? "var(--soon)" : i === 0 ? (mins > 10 ? "var(--go)" : mins > 3 ? "var(--soon)" : "var(--late)") : "var(--accent)";
   arc.style.strokeDashoffset = CIRC * (1 - Math.min(1, (e.t - n) / span));
