@@ -114,6 +114,11 @@
   .corner .dot { right: 10px; }
   .corner.r .dot { right: auto; left: 10px; }
   .corner.today .dot { display: block; }
+  /* the plan uses a different stop than your usual settings would: make it obvious, even when names are cut off */
+  .corner.changed { border-color: var(--soon); box-shadow: inset 0 0 0 1px var(--soon); }
+  .corner.changed .v { color: var(--soon); }
+  .corner .s.changed { color: var(--soon); font-weight: 600; }
+  .route-chip.changed { border-color: var(--soon); color: var(--soon); font-weight: 600; }
 
   /* ring */
   .stage { display: grid; place-items: center; min-height: 0; }
@@ -315,7 +320,7 @@ const DEFAULTS = {
   carWalk: 3,      // stop -> car on the way back
   driveSave: 15    // Pick for me: drive to a farther stop only if it lets you leave at least this much later
 };
-const BUILD = "20261109134153";   // replaced with a timestamp by publish.sh
+const BUILD = "20261109134345";   // replaced with a timestamp by publish.sh
 const DEV = !/^\d+$/.test(BUILD);
 const SCHED = BUNDLED_SCHEDULE || { routes: {}, stops: {}, feed_info: {} };
 
@@ -605,17 +610,24 @@ function plan() {
     const lbl = routeLabel(trip.route);
     const last = trip.far ? `then about ${trip.walk} min to ${name}` : `walk ${trip.walk} min`;
     events = m === "out" ? [
-      { t: trip.leave, lbl: "Leave in", what: `🚗 ${driveMin(hubId)} min → ${hub.short}` },
-      { t: trip.dep, lbl: `${lbl} leaves in`, what: `${stopName(trip.from)} → ${stopName(trip.to)}` },
+      { t: trip.leave, lbl: "Leave in", what: `🚗 ${hub.short} · ${driveMin(hubId)} min`, place: "hub" },
+      { t: trip.dep, lbl: `${lbl} leaves in`, what: `${stopName(trip.from)} → ${stopName(trip.to)}`, place: "stop" },
       { t: trip.arrive, lbl: `Arrive ${name} in`, what: `Off at ${stopName(trip.to)}, ${last}` }
     ] : [
-      { t: trip.leave, lbl: "Leave in", what: `${trip.far ? "About" : "🚶"} ${trip.walk} min → ${stopName(trip.from)}` },
+      { t: trip.leave, lbl: "Leave in", what: `${trip.far ? "" : "🚶 "}${stopName(trip.from)} · ${trip.far ? "about " : ""}${trip.walk} min`, place: "stop" },
       { t: trip.dep, lbl: `${lbl} leaves in`, what: `${stopName(trip.from)} → ${hub.short}` },
       { t: trip.arr, lbl: `Off at ${hub.short} in`, what: `${bayOf(trip.to)} · walk to car` },
       { t: trip.home, lbl: "Home in", what: `Drive ${driveMin(hubId)} min` }
     ];
   }
   return { m, place, name, hubId, hub, opts, idx, trip, events, pinned: idx !== opts.base, status, lateBy };
+}
+
+// The trip your usual settings would give right now (no today-only picks), to spot what's different today.
+function usualTrip(m) {
+  const saved = T;
+  T = { date: saved.date, mode: saved.mode, parked: saved.parked, live: saved.live, traffic: saved.traffic };
+  try { const o = options(m); return o.base >= 0 ? o.trips[o.base] : null; } finally { T = saved; }
 }
 
 /* ================= no transit left: drive instead ================= */
@@ -652,9 +664,16 @@ function setCorner(id, k, v, s, act, today) {
   el.dataset.act = act;
   el.classList.toggle("today", !!today);
 }
+function markChanged(id, whole, sub) {
+  const el = $(id); el.classList.toggle("changed", !!whole); el.querySelector(".s").classList.toggle("changed", !!sub);
+}
 function render() {
   P = plan();
   const { m, name, hub, hubId, trip } = P;
+  const U = trip ? usualTrip(m) : null;
+  P.diffHub = !!(U && U.hubId !== hubId);                 // driving to a different park & ride than usual
+  P.diffStop = !!(U && U.from !== trip.from);             // boarding at a different stop than usual
+  P.usualHub = U ? HUBS[U.hubId].short : "";
   $("mOut").classList.toggle("on", m === "out");
   $("mRet").classList.toggle("on", m === "ret");
   const hereOn = T.startId !== undefined || !!T.live;
@@ -665,16 +684,20 @@ function render() {
     setCorner("cTL", "From", T.live ? "Live (Shortcut)" : isHere ? "📍 " + (street || "Here") : startName(),
       [isHere ? hereSub : "", `${driveMin(hubId)} min${isHere ? "" : " drive"}${T.traffic ? " +" + T.traffic : ""}`].filter(Boolean).join(" · "), "from", hereOn || T.traffic);
     setCorner("cTR", "To", name, "by " + fmt(hm(eff("arriveBy"))), "to", T.dest || T.arriveBy);
-    setCorner("cBL", "Park & board", hub.short,
-      trip ? (hub.name.startsWith(bayOf(trip.from)) ? "" : bayOf(trip.from) + " · ") + "park " + fmt(trip.dep - S.park[hubId] - S.buffer) : "—", "hub", T.hub);
+    setCorner("cBL", P.diffHub ? "Different stop" : "Park & board", hub.short,
+      trip ? (P.diffHub ? "usually " + P.usualHub + " · " : hub.name.startsWith(bayOf(trip.from)) ? "" : bayOf(trip.from) + " · ") + "park " + fmt(trip.dep - S.park[hubId] - S.buffer) : "—", "hub", T.hub);
+    markChanged("cBL", P.diffHub, P.diffStop && !P.diffHub);
     setCorner("cBR", trip ? routeLabel(trip.route) : "Bus", trip ? fmt(trip.dep) : "None today",
       trip ? "arrive " + fmt(trip.arrive) + (trip.ok ? "" : " · late") : "try another stop", "bus", P.pinned);
+    markChanged("cBR", false, false);
   } else {
     setCorner("cTL", "From", name, "ready " + fmt(hm(eff("leaveAt"))), "to", T.dest || T.leaveAt);
     setCorner("cTR", "To", "Home", trip ? "about " + fmt(trip.home) : "—", "from", T.traffic);
-    setCorner("cBL", trip ? routeLabel(trip.route) : "Bus", trip ? fmt(trip.dep) : "None today",
+    setCorner("cBL", trip ? routeLabel(trip.route) + (P.diffStop ? " · new stop" : "") : "Bus", trip ? fmt(trip.dep) : "None today",
       trip ? stopName(trip.from) : "—", "bus", P.pinned);
+    markChanged("cBL", false, P.diffStop);
     setCorner("cBR", "Car at", hub.short, trip ? "off " + fmt(trip.arr) + " · " + bayOf(trip.to) : "—", "hub", T.hub);
+    markChanged("cBR", P.diffHub, false);
   }
   tick();
 }
@@ -714,7 +737,7 @@ function tick() {
   $("now").textContent = d.toLocaleDateString([], { weekday: "short" }) + " " + fmt(d.getHours() * 60 + d.getMinutes());
   if (!P) return;
   const ev = P.events, n = nowMin(), arc = $("arc"), chip = $("what");
-  chip.dataset.act = "route"; delete chip.dataset.v;
+  chip.dataset.act = "route"; delete chip.dataset.v; chip.classList.remove("changed");
   $("recalc").classList.toggle("spin", hereState === "finding");
   setIsland(null); $("at").className = "at";
   if (P.status === "arrived") {
@@ -775,7 +798,9 @@ function tick() {
   $("count").textContent = i === 0 && mins < 0.75 ? "Now" : countdown(left);
   if (left > 30) setIsland({ sec: left, lbl: behind && i === 1 ? routeLabel(P.trip.route) + " leaves" : e.lbl.replace(/ in$/, "") });
   atTime("at", e.t);
-  chip.textContent = behind && i === 1 ? ev[0].what : e.what;   // behind: the drive is still the next thing to do
+  const ce = behind && i === 1 ? ev[0] : e;   // behind: the drive is still the next thing to do
+  chip.textContent = ce.what;
+  chip.classList.toggle("changed", (ce.place === "hub" && P.diffHub) || (ce.place === "stop" && P.diffStop));
   arc.style.stroke = late ? "var(--late)" : behind ? "var(--soon)" : i === 0 ? (mins > 10 ? "var(--go)" : mins > 3 ? "var(--soon)" : "var(--late)") : "var(--accent)";
   arc.style.strokeDashoffset = CIRC * (1 - Math.min(1, (e.t - n) / span));
   const warn = $("warn");
