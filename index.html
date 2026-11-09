@@ -131,6 +131,7 @@
   .route-chip::after { content: " ›"; color: var(--muted); }
   .route-chip:empty { display: none; }
   .recalc { flex: none; width: 30px; height: 30px; border-radius: 50%; border: 1px solid var(--line); background: var(--card); color: var(--muted); cursor: pointer; font-size: 15px; line-height: 1; }
+  .recalc[hidden] { display: none; }
   .recalc.spin { animation: spin .8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
   .steps { display: flex; gap: 6px; margin-top: 12px; }
@@ -257,6 +258,7 @@
         <div class="route-row">
           <button class="route-chip" id="what" data-act="route" aria-label="Route options"></button>
           <button class="recalc" id="recalc" data-act="recalc" aria-label="Recalculate">↻</button>
+          <button class="recalc" id="island" data-act="island" aria-label="Show the countdown in the Dynamic Island" hidden>⏱</button>
         </div>
         <div class="warn" id="warn"></div>
         <div class="steps" id="steps"></div>
@@ -308,7 +310,7 @@ const DEFAULTS = {
   cushion: 1,      // arrive at least this early
   carWalk: 3       // stop -> car on the way back
 };
-const BUILD = "20261108152337";   // replaced with a timestamp by publish.sh
+const BUILD = "20261108165813";   // replaced with a timestamp by publish.sh
 const DEV = !/^\d+$/.test(BUILD);
 const SCHED = BUNDLED_SCHEDULE || { routes: {}, stops: {}, feed_info: {} };
 
@@ -655,6 +657,31 @@ function countdown(sec) {
   const h = Math.floor(sec / 3600), mm = Math.floor(sec % 3600 / 60), ss = sec % 60;
   return h ? `${h}:${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}` : `${mm}:${String(ss).padStart(2, "0")}`;
 }
+/* Dynamic Island: a web app can't make a Live Activity, but an iOS Shortcut can start a Clock timer, which shows there. */
+const SHORTCUT = "StartNow Timer";
+const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+let islandTarget = null;   // { sec, lbl } of the countdown on screen
+function setIsland(t) { islandTarget = t; $("island").hidden = !t || !(IS_IOS || DEV); }
+function runIsland() {
+  if (!islandTarget) return;
+  const sec = Math.max(1, Math.round(islandTarget.sec));
+  toast(`Timer: ${countdown(sec)} · ${islandTarget.lbl}`);
+  setTimeout(() => { location.href = "shortcuts://run-shortcut?name=" + encodeURIComponent(SHORTCUT) + "&input=text&text=" + sec; }, 300);
+}
+function sheetIsland() {
+  openSheet(`
+    <h2>Countdown in the Dynamic Island</h2>
+    <p class="note" style="margin-top:0">Websites can't put things in the Dynamic Island, but your iPhone's Clock timer can. ⏱ starts a Clock timer for the time on the ring, using a Shortcut you add once:</p>
+    <ol class="steps-help">
+      <li>Open the <b>Shortcuts</b> app, tap <b>+</b>, and name the shortcut exactly <b>${SHORTCUT}</b>.</li>
+      <li>Add the action <b>Start Timer</b>.</li>
+      <li>Tap its time (e.g. “30 minutes”), pick <b>Shortcut Input</b>, then set the unit to <b>seconds</b>.</li>
+      <li>Tap <b>Done</b>. Come back here and tap the button below. If your iPhone asks to open Shortcuts, tap <b>Open</b>.</li>
+    </ol>
+    <button class="chip on" data-act="islandReady">I've added it · start the timer</button>
+    <p class="note">The timer shows in the Dynamic Island and on the Lock Screen, and rings when it's time. It doesn't follow plan changes: tap ⏱ again after changing your plan (and cancel the old timer). After it starts, swipe back to Start Now.</p>
+  `);
+}
 function tick() {
   const d = new Date();
   $("now").textContent = d.toLocaleDateString([], { weekday: "short" }) + " " + fmt(d.getHours() * 60 + d.getMinutes());
@@ -662,6 +689,7 @@ function tick() {
   const ev = P.events, n = nowMin(), arc = $("arc"), chip = $("what");
   chip.dataset.act = "route"; delete chip.dataset.v;
   $("recalc").classList.toggle("spin", hereState === "finding");
+  setIsland(null);
   if (P.status === "arrived") {
     $("lbl").textContent = `You're at ${P.name}`;
     $("count").textContent = "✓";
@@ -718,6 +746,7 @@ function tick() {
   const mins = left / 60, late = P.status === "late", behind = P.status === "behind";
   $("lbl").textContent = behind && i === 1 ? `Leave now · ${routeLabel(P.trip.route)} leaves in` : i === 0 && mins < 0.75 ? "Leave now" : e.lbl;
   $("count").textContent = i === 0 && mins < 0.75 ? "Now" : countdown(left);
+  if (left > 30) setIsland({ sec: left, lbl: behind && i === 1 ? routeLabel(P.trip.route) + " leaves" : e.lbl.replace(/ in$/, "") });
   $("at").textContent = "at " + fmt(e.t);
   chip.textContent = behind && i === 1 ? ev[0].what : e.what;   // behind: the drive is still the next thing to do
   arc.style.stroke = late ? "var(--late)" : behind ? "var(--soon)" : i === 0 ? (mins > 10 ? "var(--go)" : mins > 3 ? "var(--soon)" : "var(--late)") : "var(--accent)";
@@ -918,7 +947,7 @@ function sheetSettings(welcome) {
     <h3>Cushions</h3>
     <div class="field"><label>Be at the stop early</label>${stepper("sBuffer", S.buffer, " min")}</div>
     <div class="field"><label>Arrive early by at least</label>${stepper("sCushion", S.cushion, " min")}</div>
-    <p class="note">Version ${DEV ? "dev" : BUILD.replace(/^(\d{4})(\d\d)(\d\d)(\d\d)(\d\d).*/, "$1-$2-$3 $4:$5")} · <button class="link inline" data-act="checkUpdate">Check for update</button> · <button class="link inline" data-act="hardReload">Reload app</button><br>
+    <p class="note">Version ${DEV ? "dev" : BUILD.replace(/^(\d{4})(\d\d)(\d\d)(\d\d)(\d\d).*/, "$1-$2-$3 $4:$5")} · <button class="link inline" data-act="checkUpdate">Check for update</button> · <button class="link inline" data-act="hardReload">Reload app</button>${IS_IOS || DEV ? ` · <button class="link inline" data-act="islandSetup">Dynamic Island timer</button>` : ""}<br>
       Routes: ${Object.keys(SCHED.routes || {}).map(routeLabel).join(", ")}. Timetable valid until ${end}.${expired ? ' <b style="color:var(--late)">Expired: reload when online for an update.</b>' : ""}</p>
     ${welcome ? `<button class="chip on" data-act="close" style="margin-top:14px">Done</button>` : `
     <h3>Start over</h3>
@@ -1236,6 +1265,9 @@ document.addEventListener("click", ev => {
     case "driveInstead": { const [, to] = driveInsteadEnds(); if (to) openDirections(to); return; }
     case "busList": sheetBus(); return;
     case "pickRoute": T.hub = b.dataset.h; T.bus_out = { dep: +v, route: b.dataset.r, hub: b.dataset.h, dest: eff("dest") }; break;
+    case "island": if (store.get("startnow.island", false)) runIsland(); else sheetIsland(); return;
+    case "islandReady": store.set("startnow.island", true); closeSheet(); runIsland(); return;
+    case "islandSetup": sheetIsland(); return;
     case "recalc": {
       $("recalc").classList.add("spin"); legCache.clear(); saveT();
       refreshHere(true).then(() => { render(); checkForUpdate(); toast("Recalculated " + fmt(nowMin())); if ($("sheet").classList.contains("open") && $("sheetBody").querySelector("[data-act=pickRoute]")) sheetRoute(); });
