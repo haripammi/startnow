@@ -320,7 +320,7 @@ const DEFAULTS = {
   carWalk: 3,      // stop -> car on the way back
   driveSave: 15    // Pick for me: drive to a farther stop only if it lets you leave at least this much later
 };
-const BUILD = "20261109134345";   // replaced with a timestamp by publish.sh
+const BUILD = "20261109134515";   // replaced with a timestamp by publish.sh
 const DEV = !/^\d+$/.test(BUILD);
 const SCHED = BUNDLED_SCHEDULE || { routes: {}, stops: {}, feed_info: {} };
 
@@ -329,7 +329,8 @@ const store = {
   get(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } },
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
 };
-const todayKey = () => { const d = new Date(); return d.getFullYear() + "-" + (d.getMonth() + 1) + "-" + d.getDate(); };
+// "Today" runs until 3 AM, so a late trip home isn't reset halfway at midnight; after that your usual settings return.
+const todayKey = () => { const d = new Date(Date.now() - 3 * 3600000); return d.getFullYear() + "-" + (d.getMonth() + 1) + "-" + d.getDate(); };
 const FIRST_RUN = store.get("startnow.settings", null) === null;
 function loadSettings() {
   const s = store.get("startnow.settings", {}) || {};
@@ -667,7 +668,10 @@ function setCorner(id, k, v, s, act, today) {
 function markChanged(id, whole, sub) {
   const el = $(id); el.classList.toggle("changed", !!whole); el.querySelector(".s").classList.toggle("changed", !!sub);
 }
+// A new day: drop yesterday's today-only choices (destination, times, stop, picks) before showing anything.
+function rollDay() { if (T.date !== todayKey()) { T = loadToday(); legCache.clear(); } }
 function render() {
+  rollDay();
   P = plan();
   const { m, name, hub, hubId, trip } = P;
   const U = trip ? usualTrip(m) : null;
@@ -1441,9 +1445,10 @@ let suppressClick = false;
 render();
 if (FIRST_RUN) sheetSettings(true);
 setInterval(tick, 1000);
-setInterval(() => { if (T.date !== todayKey()) { T = loadToday(); legCache.clear(); } render(); }, 30000);
+setInterval(render, 30000);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) { T = loadToday(); legCache.clear(); render(); checkForUpdate(); refreshHere(); } });
-window.addEventListener("pageshow", e => { if (e.persisted) checkForUpdate(); });
+window.addEventListener("pageshow", e => { if (e.persisted) { render(); checkForUpdate(); } });
+window.addEventListener("focus", render);
 if ("serviceWorker" in navigator && location.protocol === "https:") navigator.serviceWorker.register("sw.js").catch(() => {});
 checkForUpdate();
 if (!FIRST_RUN) refreshHere();
