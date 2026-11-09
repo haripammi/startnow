@@ -310,7 +310,7 @@ const DEFAULTS = {
   cushion: 1,      // arrive at least this early
   carWalk: 3       // stop -> car on the way back
 };
-const BUILD = "20261108165813";   // replaced with a timestamp by publish.sh
+const BUILD = "20261109080950";   // replaced with a timestamp by publish.sh
 const DEV = !/^\d+$/.test(BUILD);
 const SCHED = BUNDLED_SCHEDULE || { routes: {}, stops: {}, feed_info: {} };
 
@@ -338,7 +338,15 @@ function loadLib() {
   if (Array.isArray(old)) old.forEach(p => { if (!lib.places.some(x => x.id === p.id)) lib.places.push(p); });
   return lib;
 }
-function loadToday() { const t = store.get("startnow.today", null); return t && t.date === todayKey() ? t : { date: todayKey() }; }
+function loadToday() {
+  const t = store.get("startnow.today", null);
+  if (!t || t.date !== todayKey()) return { date: todayKey() };
+  if (t.hub !== undefined && !t.hubBy) delete t.hub;   // older builds locked the stop when you picked a route
+  return t;
+}
+// Today's park & board override. "you" = picked in Park & board (kept); a destination id = came with a
+// route you picked for that destination, so it's dropped as soon as the destination changes.
+function setHub(h, by) { if (h === undefined) { delete T.hub; delete T.hubBy; } else { T.hub = h; T.hubBy = by; } }
 let S = loadSettings();
 let LIB = loadLib();
 const saveLib = () => store.set("startnow.library", LIB);
@@ -495,7 +503,8 @@ function canCatch(t, m, n) {
   const toStop = m === "out" ? driveMin(t.hubId) : t.walk;
   return n + toStop <= t.dep;
 }
-function options(m) {
+// keep: a trip you picked; it stays in the list even if another stop's trip beats it.
+function options(m, keep) {
   const place = placeById(eff("dest"));
   const cands = candidateStops(place, m);
   const trips = [];
@@ -528,7 +537,8 @@ function options(m) {
   }
   const list = [...seen.values()].sort((a, b) => a.leave - b.leave || (m === "out" ? a.arrive - b.arrive : a.home - b.home));
   // drop rows that are strictly worse (leave earlier AND arrive later than another)
-  const clean = list.filter(t => !list.some(o => o !== t && (m === "out"
+  const kept = t => keep && t.dep === keep.dep && t.route === keep.route && t.hubId === keep.hub;
+  const clean = list.filter(t => kept(t) || !list.some(o => o !== t && (m === "out"
     ? o.leave >= t.leave && o.arrive <= t.arrive && (o.leave > t.leave || o.arrive < t.arrive)
     : o.leave >= t.leave && o.home <= t.home && (o.leave > t.leave || o.home < t.home))));
   const n = nowMin(), can = t => canCatch(t, m, n);
@@ -552,10 +562,11 @@ function options(m) {
 }
 
 function plan() {
+  if (T.hub !== undefined && T.hubBy !== "you" && T.hubBy !== eff("dest")) { setHub(undefined); saveT(); }
   const m = mode();
-  const opts = options(m);
-  let idx = opts.base;
   const pin = T["bus_" + m];
+  const opts = options(m, pin && pin.dest === eff("dest") ? pin : null);
+  let idx = opts.base;
   if (pin && pin.dest === eff("dest")) {
     const i = opts.trips.findIndex(t => t.dep === pin.dep && t.route === pin.route && t.hubId === pin.hub);
     if (i >= 0) idx = i;
@@ -959,7 +970,7 @@ function sheetSettings(welcome) {
   bind("sLeave", v => { if (v) S.leaveAt = v; });
   bind("sDest", v => { S.dest = v; });
   bind("sHub", v => { S.hub = v; });
-  if ($("sStart")) bind("sStart", v => { S.startId = v || null; delete T.hub; clearPins(); saveT(); if (S.startId === "here") refreshHere(); });
+  if ($("sStart")) bind("sStart", v => { S.startId = v || null; setHub(undefined); clearPins(); saveT(); if (S.startId === "here") refreshHere(); });
 }
 
 /* ================= map + step-by-step ================= */
@@ -1254,17 +1265,17 @@ document.addEventListener("click", ev => {
     case "settings": sheetSettings(); return;
     case "to": sheetTo(); return;
     case "from": sheetFrom(); return;
-    case "hub": if (v === undefined) { mode() === "out" ? sheetRoute() : sheetHub(); return; } T.hub = v === S.hub ? undefined : v; clearPins(); break;
+    case "hub": if (v === undefined) { mode() === "out" ? sheetRoute() : sheetHub(); return; } setHub(v === S.hub ? undefined : v, "you"); clearPins(); break;
     case "route": sheetRoute(); return;
     case "takeNext": {
       const nx = P.opts.next; if (!nx) return;
       T["bus_" + P.m] = { dep: nx.dep, route: nx.route, hub: nx.hubId, dest: eff("dest") };
-      if (eff("hub") !== "auto" && eff("hub") !== nx.hubId) T.hub = nx.hubId;
+      if (eff("hub") !== "auto" && eff("hub") !== nx.hubId) setHub(nx.hubId, eff("dest"));
       saveT(); render(); toast("Plan changed"); return;
     }
     case "driveInstead": { const [, to] = driveInsteadEnds(); if (to) openDirections(to); return; }
     case "busList": sheetBus(); return;
-    case "pickRoute": T.hub = b.dataset.h; T.bus_out = { dep: +v, route: b.dataset.r, hub: b.dataset.h, dest: eff("dest") }; break;
+    case "pickRoute": if (eff("hub") !== "auto" && eff("hub") !== b.dataset.h) setHub(b.dataset.h, eff("dest")); T.bus_out = { dep: +v, route: b.dataset.r, hub: b.dataset.h, dest: eff("dest") }; break;
     case "island": if (store.get("startnow.island", false)) runIsland(); else sheetIsland(); return;
     case "islandReady": store.set("startnow.island", true); closeSheet(); runIsland(); return;
     case "islandSetup": sheetIsland(); return;
@@ -1296,7 +1307,7 @@ document.addEventListener("click", ev => {
     case "resetToday": b.dataset.k.split(",").forEach(k => delete T[k]); clearPins(); saveT(); render(); sheetTo(); return;
     case "start":
       // New starting point: forget today's park & ride / bus picks so the best route is chosen again.
-      T.startId = (v || null) === (S.startId || null) ? undefined : (v || null); delete T.live; delete T.hub; clearPins();
+      T.startId = (v || null) === (S.startId || null) ? undefined : (v || null); delete T.live; setHub(undefined); clearPins();
       saveT(); render(); closeSheet(); if (eff("startId") === "here") refreshHere(); return;
     case "startHere": measureDrives(useToday); return;
     case "startTyped": pendingDrives = useToday; locationHelp("typed"); return;

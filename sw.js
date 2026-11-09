@@ -1,5 +1,5 @@
 // Offline support: always ask the network first (so updates arrive), fall back to the saved copy when offline.
-const CACHE = "startnow-20261108165813";
+const CACHE = "startnow-20261109080950";
 const FILES = ["./", "index.html", "manifest.webmanifest", "icon-180.png", "icon-512.png"];
 self.addEventListener("install", e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES))); self.skipWaiting(); });
 self.addEventListener("activate", e => {
