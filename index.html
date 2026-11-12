@@ -320,7 +320,7 @@ const DEFAULTS = {
   carWalk: 3,      // stop -> car on the way back
   driveSave: 15    // Pick for me: drive to a farther stop only if it lets you leave at least this much later
 };
-const BUILD = "20261109134646";   // replaced with a timestamp by publish.sh
+const BUILD = "20261111211701";   // replaced with a timestamp by publish.sh
 const DEV = !/^\d+$/.test(BUILD);
 const SCHED = BUNDLED_SCHEDULE || { routes: {}, stops: {}, feed_info: {} };
 
@@ -597,8 +597,12 @@ function plan() {
   // ok: on schedule · behind: past the leave time but still catchable (e.g. get dropped off)
   // late: catchable, but arrives after your arrive-by · missed: can't be caught · none: nothing left today
   const n = nowMin();
+  // onIt: you told us you're already following this trip, so past-the-time is fine, not "missed".
+  const on = T["on_" + m];
+  const onIt = !!(trip && on && on.dep === trip.dep && on.route === trip.route && on.hub === trip.hubId && on.dest === eff("dest"));
   let status = "ok";
   if (!trip) status = "none";
+  else if (onIt) status = m === "out" && !trip.ok ? "late" : "ok";
   else if (!opts.can(trip)) status = opts.next ? "missed" : "none";
   else if (m === "out" && !trip.ok) status = "late";
   else if (n > trip.leave + 0.5) status = "behind";
@@ -621,7 +625,7 @@ function plan() {
       { t: trip.home, lbl: "Home in", what: `Drive ${driveMin(hubId)} min` }
     ];
   }
-  return { m, place, name, hubId, hub, opts, idx, trip, events, pinned: idx !== opts.base, status, lateBy };
+  return { m, place, name, hubId, hub, opts, idx, trip, events, pinned: idx !== opts.base, status, lateBy, onIt };
 }
 
 // The trip your usual settings would give right now (no today-only picks), to spot what's different today.
@@ -765,18 +769,19 @@ function tick() {
     arc.style.stroke = "var(--late)"; arc.style.strokeDashoffset = 0; return;
   }
   if (P.status === "missed") {
-    // The planned bus has left (or you couldn't reach it even if dropped off). Offer the next one; don't switch on our own.
+    // Past the plan's times. You may already be on it (left on time, on the bus): ask before calling it missed.
+    // If not, offer the next one; don't switch on our own.
     const t = P.trip, nx = P.opts.next;
-    $("lbl").textContent = `Missed the ${routeLabel(t.route)} ${fmt(t.dep)}`;
-    $("count").textContent = "—";
-    $("at").textContent = `Next: ${routeLabel(nx.route)} ${fmt(nx.dep)} from ${HUBS[nx.hubId].short}`;
-    chip.textContent = `Switch to this plan · arrive ${fmt(P.m === "out" ? nx.arrive : nx.arr)}`;
-    chip.dataset.act = "takeNext";
+    $("lbl").textContent = `On the ${routeLabel(t.route)} ${fmt(t.dep)}?`;
+    $("count").textContent = "?";
+    $("at").textContent = `Planned to leave ${fmt(t.leave)}`;
+    chip.textContent = "✓ Yes, I'm on this plan";
+    chip.dataset.act = "onIt";
     const lateBy = P.m === "out" ? Math.round(nx.arrive - hm(eff("arriveBy"))) : 0;
-    $("warn").innerHTML = P.m !== "out" ? "" : lateBy > 0 ? `<span class="late-pill">You'd arrive ${lateBy} min late</span>`
-      : `<span class="ok-pill">Still on time</span>`;
+    const pill = P.m !== "out" ? "" : lateBy > 0 ? ` <span class="late-pill">${lateBy} min late</span>` : ` <span class="ok-pill">still on time</span>`;
+    $("warn").innerHTML = `<div class="warn-sub">Missed it? <button class="link inline" data-act="takeNext">Switch to the ${routeLabel(nx.route)} ${fmt(nx.dep)} from ${HUBS[nx.hubId].short} · arrive ${fmt(P.m === "out" ? nx.arrive : nx.arr)}</button></div>${pill}`;
     $("steps").innerHTML = "";
-    arc.style.stroke = "var(--late)"; arc.style.strokeDashoffset = 0; return;
+    arc.style.stroke = "var(--soon)"; arc.style.strokeDashoffset = 0; return;
   }
   if (!ev.length) {
     $("lbl").textContent = "No trips found";
@@ -815,9 +820,13 @@ function tick() {
     // Past the leave time but still catchable: keep the plan, say how to make it, offer a change.
     const behindBy = Math.round(n - P.trip.leave), saves = S.park[P.hubId] + S.buffer;
     warn.innerHTML = `<span class="soon-pill">Go now · still arrive ${fmt(P.trip.arrive)}</span>
-      <div class="warn-sub">${behindBy} min behind · a drop-off saves ${saves} min · <button class="link inline" data-act="route">Change plan</button></div>`;
+      <div class="warn-sub">${behindBy} min behind · a drop-off saves ${saves} min · <button class="link inline" data-act="route">Change plan</button></div>
+      <div class="warn-sub">Already on your way? <button class="link inline" data-act="onIt">Yes, I'm on it</button></div>`;
   } else if (behind) {
-    warn.innerHTML = `Leave now to make it · <button class="link inline" data-act="route">Change plan</button>`;
+    warn.innerHTML = `Leave now to make it · <button class="link inline" data-act="route">Change plan</button>
+      <div class="warn-sub">Already on your way? <button class="link inline" data-act="onIt">Yes, I'm on it</button></div>`;
+  } else if (P.onIt && n > P.trip.leave) {
+    warn.innerHTML = `<div class="warn-sub">You're on this plan · <button class="link inline" data-act="offIt">Not on it?</button></div>`;
   } else warn.textContent = "";
   renderSteps(i);
 }
@@ -933,7 +942,7 @@ function sheetRoute() {
     <h2>Route options</h2>
     <div class="field" style="padding-top:0"><label>${esc(startName())} → ${esc(P.name)}<small>${hereNote() ? esc(hereNote()) + " · " : ""}arrive by ${fmt(hm(eff("arriveBy")))}</small></label>
       <button class="chip" data-act="recalc">↻ Recalculate</button></div>
-    ${P.status === "missed" ? `<p class="late-note">Your planned ${routeLabel(P.trip.route)} ${fmt(P.trip.dep)} can't be caught any more. Pick another option below.</p>` : ""}
+    ${P.status === "missed" ? `<p class="late-note">Your planned ${routeLabel(P.trip.route)} ${fmt(P.trip.dep)} can't be caught any more, unless you're already on it. Pick another option below.</p>` : ""}
     ${P.status === "behind" ? `<p class="late-note">You're past the planned leave time, but can still make it if you go now. Or pick another option.</p>` : ""}
     ${P.status === "none" ? `<p class="late-note">No transit you can still catch today. <button class="link inline" data-act="driveInstead">Drive instead</button></p>` : ""}
     <button class="opt ${eff("hub") === "auto" && !P.pinned ? "on" : ""}" data-act="hub" data-v="auto"><span><div class="t">Pick for me</div><div class="d">Least driving, unless a farther stop lets me leave ${S.driveSave}+ min later</div></span></button>
@@ -1307,7 +1316,7 @@ const useUsual = isHome => (drive, geo, name) => {
   const st = saveStart(drive, geo, isHome ? "Home" + (name ? " · " + name : "") : name);
   S.startId = st.id; delete T.startId; saveS(); saveT(); render(); sheetSettings(FIRST_RUN); toast("Drive times saved");
 };
-function clearPins() { delete T.bus_out; delete T.bus_ret; }
+function clearPins() { delete T.bus_out; delete T.bus_ret; delete T.on_out; delete T.on_ret; }
 let toastT;
 function toast(msg) { const el = $("toast"); el.textContent = msg; el.classList.add("show"); clearTimeout(toastT); toastT = setTimeout(() => el.classList.remove("show"), 2200); }
 
@@ -1332,6 +1341,12 @@ document.addEventListener("click", ev => {
       if (eff("hub") !== "auto" && eff("hub") !== nx.hubId) setHub(nx.hubId, eff("dest"));
       saveT(); render(); toast("Plan changed"); return;
     }
+    case "onIt": {
+      const t = P.trip; if (!t) return;
+      T["on_" + P.m] = T["bus_" + P.m] = { dep: t.dep, route: t.route, hub: t.hubId, dest: eff("dest") };
+      saveT(); render(); toast("Following your plan"); return;
+    }
+    case "offIt": delete T["on_" + P.m]; saveT(); render(); return;
     case "driveInstead": { const [, to] = driveInsteadEnds(); if (to) openDirections(to); return; }
     case "busList": sheetBus(); return;
     case "pickRoute": if (eff("hub") !== "auto" && eff("hub") !== b.dataset.h) setHub(b.dataset.h, eff("dest")); T.bus_out = { dep: +v, route: b.dataset.r, hub: b.dataset.h, dest: eff("dest") }; break;
